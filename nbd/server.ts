@@ -146,6 +146,20 @@ export interface SectorMapper {
   mapRange(offset: number, length: number): TouchedFile[];
 }
 
+/**
+ * A {@link SectorMapper} that also enumerates the files it found and can re-parse the filesystem —
+ * what {@link NbdFileShare} needs to raise create/delete/modify events. Implemented by both the
+ * FAT32 and the ext4 mappers, so the share works the same way on either filesystem.
+ */
+export interface FileMapper extends SectorMapper {
+  /** List the files currently parsed (path + size + isDir). */
+  list(): Array<{ path: string; size: number; isDir: boolean }>;
+  /** Re-parse the filesystem after the guest changed it. */
+  refresh(): void;
+  /** The byte extents (offset/length pairs) a file occupies in the image. */
+  extents(path: string): Array<{ offset: number; length: number }>;
+}
+
 export interface NbdAccessEvent {
   command: 'read' | 'write' | 'trim';
   offset: number;
@@ -187,7 +201,7 @@ export interface NbdServerOptions {
  * A QEMU-compatible NBD server (fixed newstyle). Attach a guest disk to it with
  * `nbd:HOST:PORT:exportname=NAME` (or `nbd://HOST:PORT/NAME`), and intercept
  * every block read/write — optionally resolved to guest **file names** via a
- * {@link SectorMapper} (see {@link Fat32Mapper}).
+ * {@link SectorMapper} (see `Fat32Mapper` and `Ext4Mapper`).
  *
  * Emits `access` ({@link NbdAccessEvent}), `connection`, and `error`.
  *

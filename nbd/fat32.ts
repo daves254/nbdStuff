@@ -1,6 +1,6 @@
 import { openSync, readSync } from 'node:fs';
 import { BlissError } from '../errors';
-import type { NbdBackend, SectorMapper, TouchedFile } from './server';
+import type { FileMapper, NbdBackend, TouchedFile } from './server';
 
 /** A synchronous reader over the disk image (offset/length in bytes). */
 export type ImageReader = (offset: number, length: number) => Buffer;
@@ -39,7 +39,7 @@ interface Geometry {
  * const nbd = new NbdServer({ file: './shared.img', size, mapper });
  * nbd.on('access', (e) => console.log(e.command, e.files.map(f => `${f.path}+${f.fileOffset}`)));
  */
-export class Fat32Mapper implements SectorMapper {
+export class Fat32Mapper implements FileMapper {
   private geo!: Geometry;
   private fat!: Buffer;
   private clusterToFile = new Map<number, { rec: FileRec; index: number }>();

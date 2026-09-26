@@ -73,8 +73,11 @@ export interface OpenedExport {
   /** The stack's epoch: bumped by every push / pop / swap. */
   epoch: number;
   size: number;
-  /** Whether the composed image parsed as FAT32 (file names are available). */
+  /** Whether the composed image parsed as FAT32 (kept for compatibility; prefer {@link fs}). */
   fat32: boolean;
+  /** Which filesystem the engine's mapper parsed the composed image as, if any (FAT32 or ext4). */
+  fs?: 'fat32' | 'ext4';
+  /** Why the image could not be mapped (when {@link fs} is absent). */
   fatError?: string;
   layers: LayerInfo[];
   files: Array<{ path: string; size: number; isDir: boolean }>;
@@ -313,6 +316,7 @@ export class NbdEngine extends TypedEventEmitter<NbdEngineEvents> {
       epoch: Number(r.header.epoch ?? 0),
       size: Number(r.header.size),
       fat32: !!r.header.fat32,
+      ...(fsOf(r.header) ? { fs: fsOf(r.header) } : {}),
       ...(r.header.fatError ? { fatError: String(r.header.fatError) } : {}),
       layers: layersOf(r.header),
       files: filesOf(r.header),
@@ -335,11 +339,12 @@ export class NbdEngine extends TypedEventEmitter<NbdEngineEvents> {
     return layersOf((await this.request('layers')).header);
   }
 
-  /** Re-parse the composed image and return its files (empty when it is not FAT32). */
-  async rescan(): Promise<{ fat32: boolean; files: Array<{ path: string; size: number; isDir: boolean }>; layers: LayerInfo[]; epoch: number; fatError?: string }> {
+  /** Re-parse the composed image and return its files (empty when it is neither FAT32 nor ext4). */
+  async rescan(): Promise<{ fat32: boolean; fs?: 'fat32' | 'ext4'; files: Array<{ path: string; size: number; isDir: boolean }>; layers: LayerInfo[]; epoch: number; fatError?: string }> {
     const r = await this.request('rescan');
     return {
       fat32: !!r.header.fat32,
+      ...(fsOf(r.header) ? { fs: fsOf(r.header) } : {}),
       files: filesOf(r.header),
       layers: layersOf(r.header),
       epoch: Number(r.header.epoch ?? 0),
@@ -428,4 +433,10 @@ function layersOf(h: Record<string, unknown>): LayerInfo[] {
 }
 function filesOf(h: Record<string, unknown>): Array<{ path: string; size: number; isDir: boolean }> {
   return ((h.files as Array<Record<string, unknown>>) ?? []).map((f) => ({ path: String(f.path), size: Number(f.size), isDir: !!f.isDir }));
+}
+/** The filesystem the engine's mapper recognised, from the new `fs` field or the legacy `fat32` flag. */
+function fsOf(h: Record<string, unknown>): 'fat32' | 'ext4' | undefined {
+  const fs = typeof h.fs === 'string' ? h.fs : '';
+  if (fs === 'fat32' || fs === 'ext4') return fs;
+  return h.fat32 ? 'fat32' : undefined;
 }
