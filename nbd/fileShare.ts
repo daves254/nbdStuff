@@ -7,6 +7,8 @@ import type { FileMapper, NbdAccessEvent, NbdBackend, TouchedFile } from './serv
 import { Fat32Mapper } from './fat32';
 import { Ext4Mapper } from './ext4';
 import { F2fsMapper } from './f2fs';
+import { GuestCallerTracker, FanotifyCallerSource } from './caller';
+import type { CallerRecord, CallerSource } from './caller';
 import { resolveLogger } from '../logger';
 import { BlissError } from '../errors';
 import { GuestProcess, guestProcess } from '../guestProcess';
@@ -43,6 +45,22 @@ export interface FileEvent {
   process?: GuestProcess;
   /** @deprecated Use {@link process}. The same data as a plain object. */
   app?: AppInfo;
+}
+
+/**
+ * Merge the package from a bound app-data directory with the accurate caller record (real pid/uid
+ * from the kernel). The record's process (`comm`) fills in `process` only when the bind gave no
+ * package. Returns undefined when neither had anything.
+ */
+function mergeCaller(bound: AppInfo | undefined, rec: CallerRecord | undefined): AppInfo | undefined {
+  if (!bound && !rec) return undefined;
+  const info: AppInfo = { ...(bound ?? {}) };
+  if (rec) {
+    if (rec.pid !== undefined) info.pid = rec.pid;
+    if (rec.uid !== undefined) info.uid = rec.uid;
+    if (rec.comm && info.process === undefined) info.process = rec.comm;
+  }
+  return info.pid === undefined && info.uid === undefined && info.package === undefined && info.process === undefined ? undefined : info;
 }
 
 /** AppInfo → the shared GuestProcess (processName falls back to the package id). */
@@ -127,10 +145,24 @@ export interface NbdFileShareOptions {
    *   (uses more RAM/CPU in the background; index can lag by up to `attributionPollMs`);
    * - a custom {@link AppAttributor} function.
    * Requires the share to be attached to a started VM and a {@link mountPoint}.
+   *
+   * These are **path-derived** (they infer the app from the file), so they cannot distinguish the
+   * owner from the writer. For the **accurate caller** — the process the guest kernel actually
+   * attributes the operation to — use {@link NbdFileShare.trackCaller} /
+   * {@link NbdFileShare.trackCallerViaFanotify}; `attributeApp` then only selects live vs cached.
    */
   attributeApp?: boolean | 'live' | 'cached' | AppAttributor;
   /** Poll interval (ms) for `attributeApp: 'cached'`. Default 1500. */
   attributionPollMs?: number;
+  /**
+   * Retention/correlation window (ms) for **accurate** caller attribution ({@link
+   * NbdFileShare.trackCaller}): how long a kernel-reported caller record stays valid to attribute a
+   * later file event to — the window that bridges the guest syscall and the host seeing the write.
+   * Default 200. `attributeApp: 'live'` additionally waits this long for a fresh record per event.
+   */
+  attributionTimeToCacheMs?: number;
+  /** Guest path of the fanotify caller agent, for {@link NbdFileShare.trackCallerViaFanotify}. */
+  callerAgentPath?: string;
   /** Guest mount point of this share, e.g. `/mnt/media_rw/share`, for attribution. */
   mountPoint?: string;
   /**
@@ -554,6 +586,8 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   /** In-RAM path→app index for `attributeApp: 'cached'` (guest path keys). */
   private readonly attrCache = new Map<string, AppInfo>();
   private attrTimer?: ReturnType<typeof setInterval>;
+  /** Accurate caller attribution from a kernel-reported source (see {@link trackCaller}). */
+  private callerTracker?: GuestCallerTracker;
 
   constructor(opts: NbdFileShareOptions) {
     super();
@@ -1486,6 +1520,8 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   /** Stop the server and release resources. The VM calls this on stop/kill. */
   async close(): Promise<void> {
     await this.stopGuestWatch().catch(() => undefined);
+    await this.callerTracker?.stop().catch(() => undefined);
+    this.callerTracker = undefined;
     if (this.settleTimer) clearTimeout(this.settleTimer);
     if (this.attrTimer) clearInterval(this.attrTimer);
     // Unset, not just stopped: listen() after close() (a VM restart) starts them again only if they are.
@@ -1615,8 +1651,25 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   }
 
   private dispatch(ev: FileEvent): void {
-    // A file in a bound app data directory belongs to that app: no lookup needed, in any mode.
+    // A file in a bound app data directory belongs to that app (gives the package id).
     const bound = this.appFromBinds(ev.path);
+    // Accurate caller: when a kernel-reported source is tracked, it names the process that actually
+    // performed the operation (real pid/uid), not one guessed from the path. It takes precedence and
+    // is merged with the bound package. 'cached' is an instant lookup; 'live' awaits a fresh record.
+    if (this.callerTracker) {
+      const guestPath = (this.mountPoints()[0] ?? this.opts.mountPoint ?? '') + ev.path;
+      const finish = (rec: CallerRecord | undefined): void => {
+        this.attribute(ev, mergeCaller(bound, rec));
+        this.emitEvent(ev);
+      };
+      const r = this.callerTracker.resolveByMode(guestPath);
+      if (r && typeof (r as Promise<CallerRecord | undefined>).then === 'function') {
+        void (r as Promise<CallerRecord | undefined>).then(finish, () => finish(undefined));
+      } else {
+        finish(r as CallerRecord | undefined);
+      }
+      return;
+    }
     if (bound) {
       this.attribute(ev, bound);
       return this.emitEvent(ev);
@@ -1634,6 +1687,41 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       .then((app) => this.attribute(ev, app))
       .catch(() => undefined)
       .finally(() => this.emitEvent(ev));
+  }
+
+  // --- accurate caller attribution (kernel-reported, e.g. fanotify) ----------
+
+  /**
+   * Attribute file events to the **accurate caller** — the process the guest kernel says performed
+   * the operation — from a kernel-reported {@link CallerSource}, instead of guessing from the path.
+   * NBD block writeback is asynchronous and detached from the writer, so the true caller can only
+   * come from the guest at syscall time; this is that path.
+   *
+   * The tracker's mode follows {@link NbdFileShareOptions.attributeApp}: `'live'` awaits a fresh
+   * record per event, anything else reuses records within {@link
+   * NbdFileShareOptions.attributionTimeToCacheMs} (default 200 ms). While a tracker is set, events
+   * carry the real pid/uid in `e.process` (merged with the bound package when there is one). Call it
+   * after the share is listening; {@link close} stops it.
+   */
+  async trackCaller(source: CallerSource): Promise<void> {
+    await this.callerTracker?.stop().catch(() => undefined);
+    const mode = this.attrMode === 'live' ? 'live' : 'cached';
+    this.callerTracker = new GuestCallerTracker(source, { mode, timeToCacheMs: this.opts.attributionTimeToCacheMs ?? 200 });
+    await this.callerTracker.start();
+  }
+
+  /**
+   * {@link trackCaller} with a {@link FanotifyCallerSource} over the bound device, watching this
+   * share's guest mount points. Needs the share mounted ({@link mountInGuest}) and the fanotify
+   * agent present in the guest at `agentPath` (defaults to the {@link
+   * NbdFileShareOptions.callerAgentPath} option).
+   */
+  async trackCallerViaFanotify(agentPath: string | undefined = this.opts.callerAgentPath): Promise<void> {
+    if (!this.device) throw new BlissError('trackCallerViaFanotify needs a bound device — attach the share to a VM');
+    if (!agentPath) throw new BlissError('trackCallerViaFanotify needs the guest agent path (the callerAgentPath option or the argument)');
+    const mounts = this.mountPoints();
+    if (!mounts.length) throw new BlissError('trackCallerViaFanotify: mount the share in the guest first (mountInGuest)');
+    await this.trackCaller(new FanotifyCallerSource(this.device.adb, { mounts, agentPath }));
   }
 
   // --- cached attribution (background poller → in-RAM index) -----------------
