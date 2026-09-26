@@ -1,0 +1,58 @@
+name: build-agent
+
+# Builds the in-guest fanotify caller agent (guest-agent/fanotify_caller.c) for every Android ABI
+# using the NDK preinstalled on GitHub's ubuntu runners — no local toolchain, no WSL. Download the
+# artifact matching your guest (`adb shell getprop ro.product.cpu.abi`, or `adb shell uname -m`:
+# x86_64 -> x86_64, aarch64 -> arm64-v8a) and `adb push` it to the device.
+
+on:
+  push:
+    paths:
+      - 'guest-agent/**'
+      - '.github/workflows/build-agent.yml'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: x86_64          # Android-x86 / BlissOS
+            triple: x86_64-linux-android
+          - abi: arm64-v8a       # most ARM devices
+            triple: aarch64-linux-android
+          - abi: x86
+            triple: i686-linux-android
+          - abi: armeabi-v7a
+            triple: armv7a-linux-androideabi
+    env:
+      API: '24' # bionic has fanotify well before this; any API <= your device works
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve NDK toolchain
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "::error::No Android NDK found on the runner"; exit 1
+          fi
+          echo "TC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+          echo "Using NDK: $NDK"
+
+      - name: Build fanotify_caller (${{ matrix.abi }})
+        run: |
+          set -euo pipefail
+          CC="$TC/${{ matrix.triple }}${API}-clang"
+          test -x "$CC" || { echo "::error::compiler not found: $CC"; ls "$TC" | grep clang || true; exit 1; }
+          "$CC" -O2 -Wall -Wextra -o fanotify_caller guest-agent/fanotify_caller.c
+          "$TC/llvm-readelf" -h fanotify_caller | grep -E 'Class|Machine'
+          file fanotify_caller
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fanotify_caller-${{ matrix.abi }}
+          path: fanotify_caller
+          if-no-files-found: error
