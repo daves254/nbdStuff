@@ -2,8 +2,8 @@
 //
 // Everything on the guest's block path lives here, off Node's event loop: the fixed-newstyle NBD
 // protocol QEMU speaks, positional file I/O, the copy-on-write layer stack (byte-compatible with
-// src/nbd/layers.ts, so a layer written by either side is read by the other), the FAT32 and ext4
-// mappers that turn a block range back into guest file names, ground-truth redirects, and path routes to other
+// src/nbd/layers.ts, so a layer written by either side is read by the other), the FAT32, ext4 and
+// F2FS mappers that turn a block range back into guest file names, ground-truth redirects, and path routes to other
 // stores. Node keeps the control plane: it opens the export, pushes/pops/swaps layers, sets
 // redirects and routes, and receives an asynchronous stream of access events — never a callback on
 // the hot path.
@@ -1045,6 +1045,226 @@ struct Ext4 : Mapper {
 };
 
 // ----------------------------------------------------------------------------------------------
+// F2FS mapper — a port of src/nbd/f2fs.ts. F2FS is log-structured: node blocks (inodes, direct /
+// indirect nodes) are found through the Node Address Table (NAT), the current version of each NAT
+// block chosen by a bitmap in the active checkpoint and overlaid by the checkpoint's NAT journal.
+// From the root inode this walks the directory tree, resolves each file's data blocks (inode
+// i_addr + direct/indirect/double-indirect nodes) and builds a physical-block → file map.
+// ----------------------------------------------------------------------------------------------
+struct F2fs : Mapper {
+  std::function<bool(i64, size_t, char*)> rd;
+  i64 imageSize = 0;
+  u32 blockSize = 4096, blocksPerSeg = 0, logBlocksPerSeg = 0, natBlkaddr = 0, mainBlkaddr = 0, rootIno = 0;
+  u64 totalBlocks = 0;
+  std::vector<char> natBitmap; bool natBitmapLarge = false;
+  std::unordered_map<u32, u32> natJournal, nidCache;
+  std::vector<FileRec4> files;
+  std::unordered_map<u64, std::pair<u32, u32>> blockToFile;
+  std::unordered_set<u64> metadata;
+
+  static const u32 F2FS_MAGIC = 0xf2f52010u;
+  static const u32 NAT_ENTRY_PER_BLOCK = 455, ADDRS_PER_INODE = 923, ADDRS_PER_BLOCK = 1018, NIDS_PER_BLOCK = 1018;
+  static const u32 F2FS_INLINE_XATTR = 0x01, F2FS_INLINE_DATA = 0x02, F2FS_INLINE_DENTRY = 0x04, F2FS_EXTRA_ATTR = 0x20;
+  static const u32 DEF_INLINE_XATTR_ADDRS = 50;
+  static const u32 NULL_ADDR = 0, NEW_ADDR = 0xffffffffu;
+  static const u32 NR_DENTRY_IN_BLOCK = 214, SIZE_OF_DIR_ENTRY = 11, F2FS_SLOT_LEN = 8;
+  static const u32 F2FS_FT_DIR = 2, F2FS_FT_SYMLINK = 7;
+  static const u32 CP_LARGE_NAT_BITMAP_FLAG = 0x0400;
+  static const size_t MAX_FILES = 500000, MAX_BLOCKS_PER_FILE = 8000000;
+  static const int MAX_DIR_DEPTH = 64;
+
+  F2fs(std::function<bool(i64, size_t, char*)> r, i64 size) : rd(std::move(r)), imageSize(size) { parse(); }
+  std::vector<char> read(i64 off, size_t n) const { std::vector<char> b(n); if (!rd(off, n, b.data())) throw std::runtime_error("read failed"); return b; }
+  std::vector<char> block(u64 blk) const { return read((i64)blk * blockSize, blockSize); }
+  static u16 le16(const char* p) { return (u16)((u8)p[0] | ((u8)p[1] << 8)); }
+  static u32 le32(const char* p) { return le32r(p); }
+  static u64 le64(const char* p) { return (u64)le32r(p) | ((u64)le32r(p + 4) << 32); }
+
+  void parse() {
+    auto sb = read(1024, 1024);
+    if (le32(&sb[0]) != F2FS_MAGIC) throw std::runtime_error("not an F2FS filesystem (bad 0xF2F52010 magic)");
+    if (le32(&sb[16]) != 12) throw std::runtime_error("not an F2FS filesystem (block size is not 4 KiB)");
+    logBlocksPerSeg = le32(&sb[20]); blocksPerSeg = 1u << logBlocksPerSeg;
+    u32 cpBlkaddr = le32(&sb[76]); natBlkaddr = le32(&sb[84]); mainBlkaddr = le32(&sb[92]); rootIno = le32(&sb[96]);
+    totalBlocks = le64(&sb[36]);
+    if (!blocksPerSeg || !natBlkaddr || !mainBlkaddr || mainBlkaddr <= natBlkaddr || !rootIno)
+      throw std::runtime_error("not an F2FS filesystem (implausible geometry)");
+    if (imageSize > 0 && (i64)mainBlkaddr * blockSize > imageSize) throw std::runtime_error("not an F2FS filesystem (main area past the end of the volume)");
+    readCheckpoint(cpBlkaddr);
+    nidCache.clear(); blockToFile.clear(); metadata.clear(); files.clear();
+    for (u64 b = 0; b < mainBlkaddr; b++) metadata.insert(b);
+    std::unordered_set<u32> visited; walkDir(rootIno, "", visited, 0);
+  }
+
+  void readCheckpoint(u32 cpBlkaddr) {
+    u64 v0 = le64(&block(cpBlkaddr)[0]);
+    u64 v1 = le64(&block(cpBlkaddr + blocksPerSeg)[0]);
+    u32 cpBlk = v1 > v0 ? cpBlkaddr + blocksPerSeg : cpBlkaddr;
+    auto head = block(cpBlk);
+    u32 flags = le32(&head[132]), startSum = le32(&head[140]), sitBmSize = le32(&head[156]), natBmSize = le32(&head[160]);
+    natBitmapLarge = (flags & CP_LARGE_NAT_BITMAP_FLAG) != 0;
+    u32 natBmOff = natBitmapLarge ? 192 + 4 : 192 + sitBmSize;
+    u32 need = natBmOff + natBmSize;
+    std::vector<char> buf = need <= blockSize ? head : read((i64)cpBlk * blockSize, ((need + blockSize - 1) / blockSize) * blockSize);
+    natBitmap.assign(buf.begin() + natBmOff, buf.begin() + natBmOff + natBmSize);
+    natJournal.clear();
+    if (startSum > 0) {
+      auto sum = block(cpBlk + startSum);
+      u16 nNats = le16(&sum[3584]);
+      u32 cap = std::min<u32>(nNats, 40);
+      for (u32 i = 0; i < cap; i++) {
+        size_t off = 3586 + (size_t)i * 13;
+        if (off + 13 > sum.size()) break;
+        natJournal[le32(&sum[off])] = le32(&sum[off + 5]);
+      }
+    }
+  }
+
+  int natBit(u32 blockOff) const { u8 byte = blockOff / 8 < natBitmap.size() ? (u8)natBitmap[blockOff / 8] : 0; return (byte >> (7 - (blockOff & 7))) & 1; }
+
+  u32 resolveNid(u32 nid) {
+    auto c = nidCache.find(nid); if (c != nidCache.end()) return c->second;
+    u32 addr;
+    auto j = natJournal.find(nid);
+    if (j != natJournal.end()) addr = j->second;
+    else {
+      u32 blockOff = nid / NAT_ENTRY_PER_BLOCK, segOff = blockOff >> logBlocksPerSeg;
+      u32 natBlock = natBlkaddr + (segOff << (logBlocksPerSeg + 1)) + (blockOff & (blocksPerSeg - 1));
+      if (natBit(blockOff)) natBlock += blocksPerSeg;
+      auto blk = block(natBlock);
+      addr = le32(&blk[(nid % NAT_ENTRY_PER_BLOCK) * 9 + 5]);
+    }
+    nidCache[nid] = addr; return addr;
+  }
+
+  bool readNode(u32 nid, std::vector<char>& out) {
+    if (nid == 0) return false;
+    u32 addr = resolveNid(nid);
+    if (addr == NULL_ADDR || addr == NEW_ADDR || addr < mainBlkaddr || addr >= totalBlocks) return false;
+    metadata.insert(addr);
+    out = block(addr); return true;
+  }
+
+  void addrWindow(u32 inline_, const std::vector<char>& inode, u32& start, u32& end) {
+    bool extra = (inline_ & F2FS_EXTRA_ATTR) != 0;
+    u32 extraSlots = extra ? le16(&inode[360]) / 4 : 0;
+    u32 xattrSlots = 0;
+    if (inline_ & F2FS_INLINE_XATTR) { u32 sized = extra ? le16(&inode[362]) : 0; xattrSlots = sized > 0 ? sized : DEF_INLINE_XATTR_ADDRS; }
+    start = extraSlots; end = ADDRS_PER_INODE > xattrSlots ? ADDRS_PER_INODE - xattrSlots : extraSlots; if (end < start) end = start;
+  }
+
+  void inodeBlocks(const std::vector<char>& inode, u32 inline_, std::vector<u64>& blocks, std::vector<u64>& logical) {
+    if (inline_ & F2FS_INLINE_DATA) return;
+    u64 logicalBlock = 0;
+    auto addAddr = [&](u32 addr) -> bool {
+      if (blocks.size() >= MAX_BLOCKS_PER_FILE) return false;
+      if (addr != NULL_ADDR && addr != NEW_ADDR && addr >= mainBlkaddr && addr < totalBlocks) { blocks.push_back(addr); logical.push_back(logicalBlock); }
+      logicalBlock++; return true;
+    };
+    u32 start, end; addrWindow(inline_, inode, start, end);
+    for (u32 s = start; s < end; s++) if (!addAddr(le32(&inode[360 + s * 4]))) return;
+    auto iNid = [&](u32 k) { return le32(&inode[4052 + k * 4]); };
+    std::function<bool(u32)> walkDirect = [&](u32 nid) -> bool {
+      std::vector<char> node; if (!readNode(nid, node)) { logicalBlock += ADDRS_PER_BLOCK; return true; }
+      for (u32 i = 0; i < ADDRS_PER_BLOCK; i++) if (!addAddr(le32(&node[i * 4]))) return false;
+      return true;
+    };
+    std::function<bool(u32, int)> walkIndirect = [&](u32 nid, int depth) -> bool {
+      std::vector<char> node;
+      if (!readNode(nid, node)) { logicalBlock += (u64)(depth == 1 ? ADDRS_PER_BLOCK : (u64)NIDS_PER_BLOCK * ADDRS_PER_BLOCK) * NIDS_PER_BLOCK; return true; }
+      for (u32 i = 0; i < NIDS_PER_BLOCK; i++) { u32 child = le32(&node[i * 4]); if (depth == 1 ? !walkDirect(child) : !walkIndirect(child, 1)) return false; }
+      return true;
+    };
+    if (!walkDirect(iNid(0))) return;
+    if (!walkDirect(iNid(1))) return;
+    if (!walkIndirect(iNid(2), 1)) return;
+    if (!walkIndirect(iNid(3), 1)) return;
+    walkIndirect(iNid(4), 2);
+  }
+
+  void reg(FileRec4 rec) {
+    if (files.size() >= MAX_FILES) return;
+    u32 idx = (u32)files.size();
+    for (u32 i = 0; i < rec.blocks.size(); i++) if (!blockToFile.count(rec.blocks[i])) blockToFile[rec.blocks[i]] = {idx, i};
+    files.push_back(std::move(rec));
+  }
+
+  struct Dent { u32 nid; std::string name; u32 type; };
+
+  void walkDir(u32 ino, const std::string& parent, std::unordered_set<u32>& visited, int depth) {
+    if (depth > MAX_DIR_DEPTH || visited.count(ino) || files.size() >= MAX_FILES) return;
+    visited.insert(ino);
+    std::vector<char> inode; if (!readNode(ino, inode)) return;
+    u32 inl = (u8)inode[3];
+    if (!parent.empty()) { std::vector<u64> b, l; inodeBlocks(inode, inl, b, l); reg({parent, true, le64(&inode[16]), b, l}); }
+    for (auto& c : dirEntries(inode, inl)) {
+      if (c.name == "." || c.name == ".." || c.nid == 0) continue;
+      std::string path = parent + "/" + c.name;
+      std::vector<char> ci; if (!readNode(c.nid, ci)) continue;
+      u32 cInl = (u8)ci[3]; u32 mode = le16(&ci[0]);
+      bool isDir = (mode & 0xf000) == 0x4000 || c.type == F2FS_FT_DIR;
+      if (isDir) walkDir(c.nid, path, visited, depth + 1);
+      else if (!(c.type == F2FS_FT_SYMLINK && (mode & 0xf000) == 0xa000)) {
+        std::vector<u64> b, l; inodeBlocks(ci, cInl, b, l);
+        reg({path, false, le64(&ci[16]), b, l});
+      }
+    }
+  }
+
+  std::vector<Dent> dirEntries(const std::vector<char>& inode, u32 inl) {
+    std::vector<Dent> out;
+    if (inl & F2FS_INLINE_DENTRY) {
+      u32 start, end; addrWindow(inl, inode, start, end);
+      parseDentries(inode, 360 + start * 4, (end - start) * 4, true, out);
+      return out;
+    }
+    std::vector<u64> blocks, logical; inodeBlocks(inode, inl, blocks, logical);
+    for (u64 b : blocks) { auto buf = block(b); parseDentries(buf, 0, blockSize, false, out); }
+    return out;
+  }
+
+  void parseDentries(const std::vector<char>& buf, u32 base, u32 bytes, bool inlineLayout, std::vector<Dent>& out) {
+    u32 slots, bitmapOff, entryOff, nameOff;
+    const u32 bitmapSizeReg = (NR_DENTRY_IN_BLOCK + 7) / 8;                 // 27
+    const u32 reservedReg = 4096 - ((SIZE_OF_DIR_ENTRY + F2FS_SLOT_LEN) * NR_DENTRY_IN_BLOCK + bitmapSizeReg); // 3
+    if (!inlineLayout) {
+      slots = NR_DENTRY_IN_BLOCK; bitmapOff = base; entryOff = base + bitmapSizeReg + reservedReg; nameOff = entryOff + NR_DENTRY_IN_BLOCK * SIZE_OF_DIR_ENTRY;
+    } else {
+      slots = (bytes * 8) / (SIZE_OF_DIR_ENTRY * 8 + F2FS_SLOT_LEN * 8 + 1);
+      u32 bitmapSize = (slots + 7) / 8; bitmapOff = base; entryOff = base + bitmapSize; nameOff = entryOff + slots * SIZE_OF_DIR_ENTRY;
+    }
+    auto bitSet = [&](u32 i) { u32 bi = bitmapOff + (i >> 3); return bi < buf.size() && (((u8)buf[bi] >> (i & 7)) & 1); };
+    u32 i = 0;
+    while (i < slots) {
+      if (!bitSet(i)) { i++; continue; }
+      size_t eo = entryOff + (size_t)i * SIZE_OF_DIR_ENTRY;
+      if (eo + SIZE_OF_DIR_ENTRY > buf.size()) break;
+      u32 nid = le32(&buf[eo + 4]); u16 nameLen = le16(&buf[eo + 8]); u8 type = (u8)buf[eo + 10];
+      u32 usedSlots = std::max<u32>(1, (nameLen + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN);
+      size_t no = nameOff + (size_t)i * F2FS_SLOT_LEN;
+      if (nid > 0 && nameLen > 0 && no + nameLen <= buf.size()) out.push_back({nid, std::string(&buf[no], nameLen), type});
+      i += usedSlots;
+    }
+  }
+
+  static void pushMerged(std::vector<Touched>& out, Touched t) { if (!out.empty() && out.back().path == t.path && out.back().fileOffset + out.back().bytes == t.fileOffset) out.back().bytes += t.bytes; else out.push_back(std::move(t)); }
+  std::vector<Touched> mapRange(i64 offset, i64 length) const override {
+    std::vector<Touched> out; i64 pos = offset, end = offset + length;
+    while (pos < end) {
+      u64 blk = (u64)(pos / blockSize); i64 within = pos - (i64)blk * blockSize; i64 chunk = std::min(end - pos, (i64)blockSize - within);
+      auto it = blockToFile.find(blk);
+      if (it != blockToFile.end()) pushMerged(out, {files[it->second.first].path, (i64)it->second.second * blockSize + within, chunk});
+      else if (metadata.count(blk)) pushMerged(out, {"<metadata>", pos, chunk});
+      else pushMerged(out, {"<free>", pos, chunk});
+      pos += chunk;
+    }
+    return out;
+  }
+  const char* fsName() const override { return "f2fs"; }
+  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)); a.push(o); } return a; }
+};
+
+// ----------------------------------------------------------------------------------------------
 // Events to Node: one queue for the engine, drained by the control connection's pump.
 // ----------------------------------------------------------------------------------------------
 struct Ev { int kind = 0; /* 0 access, 1 connection */ std::string command; i64 offset = 0, length = 0; std::vector<Touched> files; std::string remote; };
@@ -1098,6 +1318,8 @@ struct Export {
     catch (std::exception& e) { errs = std::string("fat32: ") + e.what(); }
     try { mapper.reset(new Ext4(rd, size)); fs = "ext4"; mapError.clear(); return; }
     catch (std::exception& e) { errs += std::string("; ext4: ") + e.what(); }
+    try { mapper.reset(new F2fs(rd, size)); fs = "f2fs"; mapError.clear(); return; }
+    catch (std::exception& e) { errs += std::string("; f2fs: ") + e.what(); }
     mapper.reset(); fs.clear(); mapError = errs;
   }
   static bool interceptable(const std::string& p) { return p != "<metadata>" && p != "<free>"; }

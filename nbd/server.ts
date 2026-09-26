@@ -149,7 +149,7 @@ export interface SectorMapper {
 /**
  * A {@link SectorMapper} that also enumerates the files it found and can re-parse the filesystem —
  * what {@link NbdFileShare} needs to raise create/delete/modify events. Implemented by both the
- * FAT32 and the ext4 mappers, so the share works the same way on either filesystem.
+ * FAT32, ext4 and F2FS mappers, so the share works the same way on any of them.
  */
 export interface FileMapper extends SectorMapper {
   /** List the files currently parsed (path + size + isDir). */
@@ -201,7 +201,7 @@ export interface NbdServerOptions {
  * A QEMU-compatible NBD server (fixed newstyle). Attach a guest disk to it with
  * `nbd:HOST:PORT:exportname=NAME` (or `nbd://HOST:PORT/NAME`), and intercept
  * every block read/write — optionally resolved to guest **file names** via a
- * {@link SectorMapper} (see `Fat32Mapper` and `Ext4Mapper`).
+ * {@link SectorMapper} (see `Fat32Mapper`, `Ext4Mapper` and `F2fsMapper`).
  *
  * Emits `access` ({@link NbdAccessEvent}), `connection`, and `error`.
  *

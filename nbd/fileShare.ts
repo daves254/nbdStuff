@@ -6,6 +6,7 @@ import { FileBackend, NbdServer } from './server';
 import type { FileMapper, NbdAccessEvent, NbdBackend, TouchedFile } from './server';
 import { Fat32Mapper } from './fat32';
 import { Ext4Mapper } from './ext4';
+import { F2fsMapper } from './f2fs';
 import { resolveLogger } from '../logger';
 import { BlissError } from '../errors';
 import { GuestProcess, guestProcess } from '../guestProcess';
@@ -505,7 +506,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   private server?: NbdServer;
   private mapper?: FileMapper;
   /** Which filesystem the host-side mapper parsed the composed image as (for messages/telemetry). */
-  private filesystem?: 'fat32' | 'ext4';
+  private filesystem?: 'fat32' | 'ext4' | 'f2fs';
   private base?: NbdBackend;
   /** The layer stack, when this share was given `layers` (else undefined). */
   private _stack?: LayerStack;
@@ -803,7 +804,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
    * Which filesystem the host-side mapper parsed the composed image as while the share is listening
    * — `'fat32'`, `'ext4'`, or undefined for a raw/unrecognised image with no host-side file events.
    */
-  get mappedFilesystem(): 'fat32' | 'ext4' | undefined {
+  get mappedFilesystem(): 'fat32' | 'ext4' | 'f2fs' | undefined {
     return this.filesystem;
   }
 
@@ -858,15 +859,16 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   }
 
   /**
-   * Parse the composed image host-side and pick the mapper for whatever filesystem it holds — FAT32
-   * or ext4 — so file-name events, redirects and per-file backup work on either. Returns undefined
-   * for a blank or unrecognised image (a raw block share with no host-side file events; use
-   * {@link watchInGuest} for guest-side events there, e.g. on a share that is neither).
+   * Parse the composed image host-side and pick the mapper for whatever filesystem it holds — FAT32,
+   * ext4 or F2FS — so file-name events, redirects and per-file backup work on any of them. Returns
+   * undefined for a blank or unrecognised image (a raw block share with no host-side file events;
+   * use {@link watchInGuest} for guest-side events there).
    */
   private buildMapper(base: NbdBackend): FileMapper | undefined {
-    const attempts: Array<{ fs: 'fat32' | 'ext4'; make: () => FileMapper }> = [
+    const attempts: Array<{ fs: 'fat32' | 'ext4' | 'f2fs'; make: () => FileMapper }> = [
       { fs: 'fat32', make: () => Fat32Mapper.fromBackend(base) },
       { fs: 'ext4', make: () => Ext4Mapper.fromBackend(base) },
+      { fs: 'f2fs', make: () => F2fsMapper.fromBackend(base) },
     ];
     const errors: string[] = [];
     for (const a of attempts) {
@@ -881,7 +883,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     }
     this.filesystem = undefined;
     this.log.warn(
-      `NbdFileShare: image is neither FAT32 nor ext4 (${errors.join('; ')}) — host file events off; use share.watchInGuest([...]) for guest-side events`,
+      `NbdFileShare: image is not a recognised filesystem (${errors.join('; ')}) — host file events off; use share.watchInGuest([...]) for guest-side events`,
     );
     return undefined;
   }
@@ -990,7 +992,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       this.engineFiles = opened.files;
       this.engineLayers = opened.layers;
       this.filesystem = opened.fs;
-      if (!opened.fs) this.log.warn(`NbdFileShare: image is neither FAT32 nor ext4 (${opened.fatError ?? 'unparsable'}) — host file events off; use share.watchInGuest([...]) for guest-side events`);
+      if (!opened.fs) this.log.warn(`NbdFileShare: image is not a recognised filesystem (${opened.fatError ?? 'unparsable'}) — host file events off; use share.watchInGuest([...]) for guest-side events`);
       this.prev = this.snapshot();
       // Everything configured before this listen() — or kept from the last one — goes to the engine now.
       for (const [path, r] of this.redirects) {
@@ -1168,7 +1170,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       this.engineFiles = r.files;
       this.engineLayers = r.layers;
       this.filesystem = r.fs;
-      if (!r.fs) this.log.warn(`NbdFileShare: composed image is neither FAT32 nor ext4 — file events disabled (${r.fatError ?? 'unparsable'})`);
+      if (!r.fs) this.log.warn(`NbdFileShare: composed image is not a recognised filesystem — file events disabled (${r.fatError ?? 'unparsable'})`);
       this.prev = this.snapshot();
       this.dirty.clear();
       return;
@@ -1356,7 +1358,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
 
   /**
    * Emit `create` / `modify` / `delete` {@link FileEvent}s (with `e.process`) for changes the guest
-   * makes under `paths`, by running `inotifyd` in the guest. FAT32 and ext4 shares are named
+   * makes under `paths`, by running `inotifyd` in the guest. FAT32, ext4 and F2FS shares are named
    * host-side by the block mapper (no agent needed); reach for this when the share is some other
    * filesystem the host mapper can't parse, or when you want the guest's own view (e.g. paths under
    * a bind, or events the block layer never sees). Needs the share attached to a VM (so a device is
