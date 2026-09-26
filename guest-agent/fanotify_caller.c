@@ -26,6 +26,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/fanotify.h>
+// FAN_EVENT_OK/NEXT, FANOTIFY_METADATA_VERSION and struct fanotify_event_metadata come from the
+// kernel UAPI header. glibc and bionic's <sys/fanotify.h> pull it in; musl defines them itself and
+// does not ship the UAPI header in its sysroot — so only include it when the macros are still
+// missing. This keeps the Android NDK, glibc and musl builds all compiling with no edits.
+#ifndef FAN_EVENT_OK
+#include <linux/fanotify.h>
+#endif
 #include <unistd.h>
 
 static long g_self_pid;
