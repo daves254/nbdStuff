@@ -152,9 +152,9 @@ export interface FileRedirect {
   /**
    * Set the file's permission bits in the guest, e.g. `0o755` or `'755'` — so a redirected binary
    * can be made executable host-side, no `chmod`/`adb` needed. This rewrites the file's **inode**
-   * (mode is metadata, not data, so it is applied by stamping the image at {@link listen}, not by
-   * the read overlay). Supported on **ext4** images with a writable base and no layers; FAT32 has no
-   * per-file mode (use the mount's `uid`/`fmask`). The file must already exist (or `create: true`).
+   * (mode is metadata, not data), applied at {@link listen} or live while serving — on the native
+   * engine too, through its `inode.stamp` control op. Supported on **ext4** images with a writable
+   * base; FAT32 has no per-file mode (use the mount's `uid`/`fmask`). The file must already exist.
    */
   mode?: number | string;
   /** Set the file's owner uid in the guest (ext4 inode; same rules as {@link mode}). */
@@ -688,7 +688,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       if (r.content !== undefined) throw new BlissError(`redirect ${r.path}: give either content or redirect, not both`);
       this.transformRedirects.set(r.path, r);
       if (this.base && this.mapper instanceof Ext4Mapper) this.resolveTransformRedirects(); // already listening (js)
-      else if (this.native) this.log.warn(`redirect ${r.path}: transform applies at the next listen() (the native engine holds the image while running)`);
+      else if (this.native) void this.resolveTransformRedirectsNative().catch((e) => this.log.warn(`redirect ${r.path}: ${(e as Error).message}`)); // already listening (native)
       return;
     }
     if (r.content === undefined) throw new BlissError(`redirect ${r.path}: needs content or a redirect transform`);
@@ -1027,9 +1027,19 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   private applyMetadataStamps(): void {
     const stamps = [...this.redirects.entries()].filter(([, r]) => r.mode !== undefined || r.ownerUID !== undefined || r.ownerGID !== undefined);
     if (!stamps.length) return;
-    // The native engine holds the image in its own process while running; stamp on the next listen().
+    // Native engine, already running: stamp the inode live through its control plane (inode.stamp).
     if (this.native) {
-      this.log.warn('NbdFileShare: redirect mode/owner will apply at the next listen() (the native engine holds the image while running)');
+      const native = this.native;
+      for (const [path, r] of stamps) {
+        void native
+          .stampInode(path, {
+            ...(r.mode !== undefined ? { mode: r.mode } : {}),
+            ...(r.ownerUID !== undefined ? { uid: r.ownerUID } : {}),
+            ...(r.ownerGID !== undefined ? { gid: r.ownerGID } : {}),
+          })
+          .then(() => this.log.info(`NbdFileShare: ${path} stamped live (native engine)`))
+          .catch((e) => this.log.warn(`NbdFileShare: live stamp ${path} failed: ${(e as Error).message}`));
+      }
       return;
     }
     const img = this.acquireExt4();
@@ -1131,6 +1141,42 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       }
     } finally {
       img.release();
+    }
+  }
+
+  /**
+   * Resolve transforms against the RUNNING native engine (which holds the image), reading current
+   * attributes/bytes through its control plane and applying the result via the flat form (which
+   * pushes content and live-stamps mode/owner).
+   */
+  private async resolveTransformRedirectsNative(): Promise<void> {
+    if (!this.native || this.transformRedirects.size === 0) return;
+    const native = this.native;
+    for (const [path, fr] of [...this.transformRedirects]) {
+      const attrs = await native.inodeAttrs(path);
+      if (!attrs.exists) {
+        if (fr.create) throw new BlissError(`redirect ${path}: create is not yet supported — create the file once in the guest first`);
+        throw new BlissError(`redirect ${path}: file does not exist in the image`);
+      }
+      // Pre-fetch the bytes so the transform's synchronous cur.data() works on the native engine.
+      let bytes: Buffer = Buffer.alloc(0);
+      try {
+        bytes = await native.readFile(path);
+      } catch (e) {
+        this.log.debug(`redirect ${path}: could not read current bytes (${(e as Error).message})`);
+      }
+      const current: CurrentFile = { exists: true, mode: attrs.mode, uid: attrs.uid, gid: attrs.gid, size: attrs.size, data: () => bytes };
+      const spec = fr.redirect!(current);
+      this.transformRedirects.delete(path);
+      this.setRedirect({
+        path,
+        content: spec.content ?? bytes,
+        ...(spec.readonly !== undefined ? { readonly: spec.readonly } : {}),
+        ...(spec.mode !== undefined ? { mode: spec.mode } : {}),
+        ...(spec.ownerUID !== undefined ? { ownerUID: spec.ownerUID } : {}),
+        ...(spec.ownerGID !== undefined ? { ownerGID: spec.ownerGID } : {}),
+        ...(spec.mirrorTo ? { mirrorTo: spec.mirrorTo } : {}),
+      });
     }
   }
 

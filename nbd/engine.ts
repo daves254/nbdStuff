@@ -363,6 +363,25 @@ export class NbdEngine extends TypedEventEmitter<NbdEngineEvents> {
     await this.request('redirect.clear', { path });
   }
 
+  /** A file's current inode attributes (ext4), read through the live composed view. */
+  async inodeAttrs(path: string): Promise<{ exists: boolean; mode: number; uid: number; gid: number; size: number }> {
+    const h = (await this.request('inode.attrs', { path })).header;
+    return { exists: !!h.exists, mode: Number(h.mode ?? 0), uid: Number(h.uid ?? 0), gid: Number(h.gid ?? 0), size: Number(h.size ?? 0) };
+  }
+  /** A file's current bytes (ext4), read through the live composed view. */
+  async readFile(path: string): Promise<Buffer> {
+    return (await this.request('inode.read', { path })).bin;
+  }
+  /** Rewrite a file's ext4 inode mode / owner in place (fixing metadata_csum), applied live. */
+  async stampInode(path: string, opts: { mode?: number; uid?: number; gid?: number }): Promise<void> {
+    await this.request('inode.stamp', {
+      path,
+      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      ...(opts.uid !== undefined ? { uid: opts.uid } : {}),
+      ...(opts.gid !== undefined ? { gid: opts.gid } : {}),
+    });
+  }
+
   /** Register a store other paths can be routed to: a copy-on-write layer over the base, or a raw file. */
   async addBackend(id: string, path: string, opts: { kind?: 'layer' | 'file'; size?: number; blockSize?: number } = {}): Promise<void> {
     await this.request('backend.add', { name: id, path, kind: opts.kind ?? 'layer', ...(opts.size ? { size: opts.size } : {}), ...(opts.blockSize ? { blockSize: opts.blockSize } : {}) });

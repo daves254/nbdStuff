@@ -503,6 +503,17 @@ struct FileBackend : Backend {
 
 static void le32w(char* p, u32 v) { p[0] = (char)v; p[1] = (char)(v >> 8); p[2] = (char)(v >> 16); p[3] = (char)(v >> 24); }
 static u32 le32r(const char* p) { return (u32)(u8)p[0] | ((u32)(u8)p[1] << 8) | ((u32)(u8)p[2] << 16) | ((u32)(u8)p[3] << 24); }
+static void le16w(char* p, u16 v) { p[0] = (char)v; p[1] = (char)(v >> 8); }
+
+// crc32c (Castagnoli, reflected) — ext4's metadata_csum. Matches src/nbd/ext4.ts's crc32c.
+static u32 crc32c(u32 seed, const char* p, size_t n) {
+  static u32 tab[256];
+  static bool init = false;
+  if (!init) { for (u32 i = 0; i < 256; i++) { u32 c = i; for (int k = 0; k < 8; k++) c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1); tab[i] = c; } init = true; }
+  u32 c = seed;
+  for (size_t i = 0; i < n; i++) c = tab[(c ^ (u8)p[i]) & 0xff] ^ (c >> 8);
+  return c;
+}
 
 // The on-disk format of src/nbd/layers.ts. `<path>` holds owned blocks packed in allocation order.
 // `<path>.map` is a 16-byte header ("NBDLAYR1", block size u32, reserved u32) followed by one
@@ -833,13 +844,14 @@ struct Fat32 : Mapper {
 // a physical-block → file map. Handles ext2/ext3 (indirect maps) and ext4 (extents, 64-bit group
 // descriptors) alike. Every count the image reports is bounded before it is believed.
 // ----------------------------------------------------------------------------------------------
-struct FileRec4 { std::string path; bool isDir; u64 size; std::vector<u64> blocks; std::vector<u64> logical; };
+struct FileRec4 { std::string path; bool isDir; u64 size; std::vector<u64> blocks; std::vector<u64> logical; u32 ino = 0; };
 struct Ext4 : Mapper {
   std::function<bool(i64, size_t, char*)> rd;
   i64 imageSize = 0;
   u32 blockSize = 0, blocksPerGroup = 0, inodesPerGroup = 0, inodeSize = 0, inodesCount = 0, firstDataBlock = 0, descSize = 0, groups = 0;
   u64 blocksCount = 0;
-  bool is64bit = false, hasFileType = false;
+  bool is64bit = false, hasFileType = false, metadataCsum = false;
+  u32 csumSeed = 0;
   std::vector<u64> inodeTableBlock;
   std::vector<FileRec4> files;
   std::unordered_map<u64, std::pair<u32, u32>> blockToFile; // physical block → (file index, index into that file's block list)
@@ -876,6 +888,8 @@ struct Ext4 : Mapper {
     hasFileType = (featureIncompat & INCOMPAT_FILETYPE) != 0;
     firstDataBlock = le32(&sb[20]);
     descSize = is64bit ? le16(&sb[254]) : 32; if (descSize < 32) descSize = 32;
+    metadataCsum = (le32(&sb[100]) & 0x400) != 0; // RO_COMPAT_METADATA_CSUM
+    csumSeed = (featureIncompat & 0x2000) ? le32(&sb[0x270]) : crc32c(0xffffffffu, &sb[104], 16); // INCOMPAT_CSUM_SEED else crc32c(~0, uuid)
     if (!blocksPerGroup || !inodesPerGroup || !blocksCount || inodeSize < 128 || inodeSize > blockSize)
       throw std::runtime_error("not an ext4 filesystem (implausible geometry)");
     u64 g = (blocksCount + blocksPerGroup - 1) / blocksPerGroup;
@@ -914,11 +928,56 @@ struct Ext4 : Mapper {
 
   /** Raw inode bytes for a 1-based inode number, or empty when out of range. */
   std::vector<char> readInode(u32 ino) const {
-    if (ino < 1 || ino > inodesCount) return {};
-    u32 group = (ino - 1) / inodesPerGroup, index = (ino - 1) % inodesPerGroup;
-    if (group >= inodeTableBlock.size()) return {};
-    i64 offset = (i64)inodeTableBlock[group] * blockSize + (i64)index * inodeSize;
+    i64 offset = inodeOffset(ino);
+    if (offset < 0) return {};
     return read(offset, inodeSize);
+  }
+  /** Byte offset of a 1-based inode in the image, or -1 when out of range. */
+  i64 inodeOffset(u32 ino) const {
+    if (ino < 1 || ino > inodesCount) return -1;
+    u32 group = (ino - 1) / inodesPerGroup, index = (ino - 1) % inodesPerGroup;
+    if (group >= inodeTableBlock.size()) return -1;
+    return (i64)inodeTableBlock[group] * blockSize + (i64)index * inodeSize;
+  }
+  /** Look up a file by path: its inode byte offset, inode number and inode size. */
+  bool inodeLoc(const std::string& path, i64& off, u32& ino, u32& isize) const {
+    for (auto& f : files) if (f.path == path) { off = inodeOffset(f.ino); if (off < 0) return false; ino = f.ino; isize = inodeSize; return true; }
+    return false;
+  }
+  /** A file's current attributes (permission bits, owner uid/gid, size). */
+  bool inodeAttrs(const std::string& path, u32& mode, u32& uid, u32& gid, u64& size) const {
+    for (auto& f : files) if (f.path == path) {
+      auto in = readInode(f.ino); if (in.empty()) return false;
+      mode = le16(&in[0]) & 0xfff; uid = le16(&in[2]) | ((u32)le16(&in[120]) << 16);
+      gid = le16(&in[24]) | ((u32)le16(&in[122]) << 16);
+      size = (u64)le32(&in[4]) | ((u64)le32(&in[108]) << 32); return true;
+    }
+    return false;
+  }
+  /** A file's current bytes (whole file), through the live composed view. */
+  std::string readFileBytes(const std::string& path, u64 cap) const {
+    for (auto& f : files) if (f.path == path) {
+      if (f.size > cap) throw std::runtime_error("inode.read: file larger than cap");
+      std::string out; out.reserve((size_t)f.size); u64 got = 0;
+      for (u64 b : f.blocks) { if (got >= f.size) break; auto blk = readBlock(b); u64 take = std::min<u64>(blockSize, f.size - got); out.append(blk.data(), (size_t)take); got += take; }
+      out.resize((size_t)f.size, '\0'); return out;
+    }
+    throw std::runtime_error("inode.read: no such file: " + path);
+  }
+  /** Rewrite mode/uid/gid in the inode bytes (each <0 = leave) and fix metadata_csum. Matches src/nbd/ext4.ts patchExt4Inode. */
+  void patchInode(char* in, u32 ino, long mode, long uid, long gid) const {
+    if (mode >= 0) { u16 t = le16(in) & 0xf000; le16w(in, (u16)(t | ((u32)mode & 0xfff))); }
+    if (uid >= 0) { le16w(in + 2, (u16)((u64)uid & 0xffff)); le16w(in + 120, (u16)(((u64)uid >> 16) & 0xffff)); }
+    if (gid >= 0) { le16w(in + 24, (u16)((u64)gid & 0xffff)); le16w(in + 122, (u16)(((u64)gid >> 16) & 0xffff)); }
+    if (metadataCsum) {
+      u16 extra = inodeSize > 128 ? le16(in + 128) : 0;
+      bool hasHi = inodeSize > 128 && extra >= (u16)(0x82 + 2 - 128);
+      std::vector<char> work(in, in + inodeSize);
+      le16w(work.data() + 124, 0); if (hasHi) le16w(work.data() + 130, 0);
+      char inumB[4], genB[4]; le32w(inumB, ino); le32w(genB, le32(in + 100));
+      u32 c = crc32c(csumSeed, inumB, 4); c = crc32c(c, genB, 4); c = crc32c(c, work.data(), inodeSize);
+      le16w(in + 124, (u16)(c & 0xffff)); if (hasHi) le16w(in + 130, (u16)((c >> 16) & 0xffff));
+    }
   }
 
   /** The physical blocks of an inode in logical order, via its extent tree or indirect map. */
@@ -994,7 +1053,7 @@ struct Ext4 : Mapper {
     auto inode = readInode(ino);
     if (inode.empty()) return;
     std::vector<u64> blocks, logical; inodeBlocks(inode, blocks, logical);
-    if (!parent.empty()) reg({parent, true, le32(&inode[4]), blocks, logical});
+    if (!parent.empty()) reg({parent, true, le32(&inode[4]), blocks, logical, ino});
     std::vector<char> dirData; for (u64 b : blocks) { auto blk = readBlock(b); dirData.insert(dirData.end(), blk.begin(), blk.end()); }
     // A directory's entries are a per-block linked list of ext4_dir_entry_2; walking each block by
     // rec_len steps entry to entry, and an htree index block (one inode-0 record spanning the block)
@@ -1017,7 +1076,7 @@ struct Ext4 : Mapper {
               else if (mode == IFREG || mode == IFLNK || fileType == 1) {
                 u64 size = (u64)le32(&child[4]) | ((u64)le32(&child[108]) << 32);
                 std::vector<u64> cb, cl; inodeBlocks(child, cb, cl);
-                reg({path, false, size, cb, cl});
+                reg({path, false, size, cb, cl, childIno});
               }
             }
           }
@@ -1687,6 +1746,42 @@ static void handle(const J& req, const std::string& bin, J& h, std::string& obin
     auto it = ex->redirects.find(req.strOr("path", ""));
     if (it != ex->redirects.end()) { if (it->second.mirror) it->second.mirror->close(); ex->redirects.erase(it); }
     h.set("ok", J::boolean(true)); return;
+  }
+  if (op == "inode.attrs" || op == "inode.read") {
+    std::shared_lock<RwLock> g(ex->mu);
+    Ext4* e4 = dynamic_cast<Ext4*>(ex->mapper.get());
+    if (!e4) throw std::runtime_error(op + ": the image is not ext4");
+    std::string path = req.strOr("path", "");
+    if (op == "inode.attrs") {
+      u32 mode, uid, gid; u64 size;
+      bool exists = e4->inodeAttrs(path, mode, uid, gid, size);
+      h.set("ok", J::boolean(true)).set("exists", J::boolean(exists));
+      if (exists) h.set("mode", J::num(mode)).set("uid", J::num(uid)).set("gid", J::num(gid)).set("size", J::num((double)size));
+      return;
+    }
+    obin = e4->readFileBytes(path, 256ull << 20); // cap the current-bytes read at 256 MiB
+    h.set("ok", J::boolean(true));
+    return;
+  }
+  if (op == "inode.stamp") {
+    std::unique_lock<RwLock> g(ex->mu);
+    Ext4* e4 = dynamic_cast<Ext4*>(ex->mapper.get());
+    if (!e4) throw std::runtime_error("inode.stamp: the image is not ext4 (FAT32 has no per-file mode)");
+    std::string path = req.strOr("path", "");
+    i64 off; u32 ino, isize;
+    if (!e4->inodeLoc(path, off, ino, isize)) throw std::runtime_error("inode.stamp: no such file: " + path);
+    auto top = ex->stack.top();
+    if (top->readonly()) throw std::runtime_error("inode.stamp: the top layer is read-only");
+    std::vector<char> in((size_t)isize);
+    if (!top->read(off, isize, in.data())) throw std::runtime_error("inode.stamp: read failed");
+    long mode = req.get("mode") ? (long)req.numOr("mode", 0) : -1;
+    long uid = req.get("uid") ? (long)req.numOr("uid", 0) : -1;
+    long gid = req.get("gid") ? (long)req.numOr("gid", 0) : -1;
+    e4->patchInode(in.data(), ino, mode, uid, gid);
+    if (!top->write(off, in.data(), isize)) throw std::runtime_error("inode.stamp: write failed");
+    ex->stack.flush();
+    h.set("ok", J::boolean(true));
+    return;
   }
   if (op == "backend.add") {
     std::string id = req.strOr("name", ""), path = req.strOr("path", ""), kind = req.strOr("kind", "layer");
