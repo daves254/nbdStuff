@@ -7,7 +7,7 @@ import type { FileMapper, NbdAccessEvent, NbdBackend, TouchedFile } from './serv
 import { Fat32Mapper } from './fat32';
 import { Ext4Mapper, patchExt4Inode } from './ext4';
 import { F2fsMapper } from './f2fs';
-import { GuestCallerTracker, FanotifyCallerSource } from './caller';
+import { GuestCallerTracker, FanotifyCallerSource, FtraceCallerSource } from './caller';
 import type { CallerRecord, CallerSource } from './caller';
 import { resolveLogger } from '../logger';
 import { BlissError } from '../errors';
@@ -644,6 +644,8 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   private engineFiles: EngineFileInfo[] = [];
   /** guest-path → image-derived owner, rebuilt from {@link engineFiles} on each native listing. */
   private engineOwners = new Map<string, FileOwner>();
+  /** inode number → in-image path, rebuilt from {@link engineFiles} (for ftrace correlation). */
+  private engineInos = new Map<number, string>();
   private engineLayers: LayerInfo[] = [];
   /** Path routes to per-context stores (both engines). */
   private routes: Array<{ match: string; prefix: boolean; backendId: string }> = [];
@@ -1946,11 +1948,15 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   private setEngineFiles(files: EngineFileInfo[]): void {
     this.engineFiles = files;
     const owners = new Map<string, FileOwner>();
+    const inos = new Map<number, string>();
     for (const f of files) {
-      if (f.uid === undefined && f.gid === undefined && f.mode === undefined) continue;
-      owners.set(f.path, { uid: f.uid ?? 0, gid: f.gid ?? 0, mode: f.mode ?? 0 });
+      if (f.uid !== undefined || f.gid !== undefined || f.mode !== undefined) {
+        owners.set(f.path, { uid: f.uid ?? 0, gid: f.gid ?? 0, mode: f.mode ?? 0 });
+      }
+      if (f.ino !== undefined && !inos.has(f.ino)) inos.set(f.ino, f.path);
     }
     this.engineOwners = owners;
+    this.engineInos = inos;
   }
 
   /**
@@ -1961,6 +1967,20 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   ownerOf(path: string): FileOwner | undefined {
     if (this.native) return this.engineOwners.get(path);
     return this.mapper?.owner?.(path);
+  }
+
+  /**
+   * The in-image path of an inode number (native engine listing, or the in-process mapper), or
+   * undefined when unknown. Used to correlate ftrace tracepoints (which name inodes, not paths).
+   */
+  pathForInode(ino: number): string | undefined {
+    if (this.native) return this.engineInos.get(ino);
+    return this.mapper?.pathForInode?.(ino);
+  }
+
+  /** The prefix `dispatch` keys guest paths by (mount point, or the configured one, or empty). */
+  private guestPathPrefix(): string {
+    return this.mountPoints()[0] ?? this.opts.mountPoint ?? '';
   }
 
   /**
@@ -1986,7 +2006,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     // performed the operation (real pid/uid), not one guessed from the path. It takes precedence and
     // is merged with the bound package. 'cached' is an instant lookup; 'live' awaits a fresh record.
     if (this.callerTracker) {
-      const guestPath = (this.mountPoints()[0] ?? this.opts.mountPoint ?? '') + ev.path;
+      const guestPath = this.guestPathPrefix() + ev.path;
       const finish = (rec: CallerRecord | undefined): void => {
         this.attribute(ev, mergeCaller(bound, rec));
         this.emitEvent(ev);
@@ -2079,6 +2099,41 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     const mounts = opts.mounts?.length ? opts.mounts : this.mountPoints();
     if (!mounts.length) return bail('no mount to watch — pass { mounts: ["/data"] } (or mount the share first with mountInGuest)');
     return this.trackCaller(new FanotifyCallerSource(this.device.adb, { mounts, agentPath }));
+  }
+
+  /**
+   * {@link trackCaller} via the guest kernel's **ftrace** tracepoints — the accurate-caller path for
+   * kernels that lack fanotify (no CONFIG_FANOTIFY) but have CONFIG_FTRACE and the ext4/f2fs write
+   * tracepoints (BlissOS, many Android-x86 builds). The tracepoints report the causing pid/comm and
+   * the inode number; the inode is resolved back to a path through this share's block mapper (which
+   * parses the very image the guest mounts, so its inode numbers match the kernel's). No agent binary
+   * and no CAP_SYS_ADMIN are needed — only root to read tracefs.
+   *
+   * Returns false (and logs, never throwing) when there is no device, or tracefs/the events are
+   * absent — the share then falls back to image-derived owner attribution. Pass `dev` (`"maj,min"`,
+   * e.g. `"254,0"`) to accept only events on the share's device, and `events` to widen/replace the
+   * default ext4 write set (e.g. add `'f2fs/f2fs_write_begin'` for an f2fs image).
+   */
+  async trackCallerViaFtrace(opts: { tracefs?: string; events?: string[]; dev?: string } = {}): Promise<boolean> {
+    if (!this.device) {
+      this.log.warn(
+        'NbdFileShare: cannot start ftrace caller tracking (needs a bound device — attach the share to a VM); ' +
+          'falling back to image-derived owner attribution',
+      );
+      return false;
+    }
+    return this.trackCaller(
+      new FtraceCallerSource(this.device.adb, {
+        // Resolve the inode the kernel reported to the same guest-path key dispatch looks events up by.
+        resolve: (ino) => {
+          const p = this.pathForInode(ino);
+          return p === undefined ? undefined : this.guestPathPrefix() + p;
+        },
+        ...(opts.tracefs ? { tracefs: opts.tracefs } : {}),
+        ...(opts.events ? { events: opts.events } : {}),
+        ...(opts.dev ? { dev: opts.dev } : {}),
+      }),
+    );
   }
 
   // --- cached attribution (background poller → in-RAM index) -----------------

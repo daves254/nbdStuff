@@ -1106,7 +1106,7 @@ struct Ext4 : Mapper {
     return out;
   }
   const char* fsName() const override { return "ext4"; }
-  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)).set("uid", J::num(f.uid)).set("gid", J::num(f.gid)).set("mode", J::num(f.mode)); a.push(o); } return a; }
+  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)).set("ino", J::num(f.ino)).set("uid", J::num(f.uid)).set("gid", J::num(f.gid)).set("mode", J::num(f.mode)); a.push(o); } return a; }
 };
 
 // ----------------------------------------------------------------------------------------------
@@ -1266,7 +1266,7 @@ struct F2fs : Mapper {
     visited.insert(ino);
     std::vector<char> inode; if (!readNode(ino, inode)) return;
     u32 inl = (u8)inode[3];
-    if (!parent.empty()) { std::vector<u64> b, l; inodeBlocks(inode, inl, b, l); FileRec4 r{parent, true, le64(&inode[16]), b, l}; ownerOf(inode, r.uid, r.gid, r.mode); reg(std::move(r)); }
+    if (!parent.empty()) { std::vector<u64> b, l; inodeBlocks(inode, inl, b, l); FileRec4 r{parent, true, le64(&inode[16]), b, l}; r.ino = ino; ownerOf(inode, r.uid, r.gid, r.mode); reg(std::move(r)); }
     for (auto& c : dirEntries(inode, inl)) {
       if (c.name == "." || c.name == ".." || c.nid == 0) continue;
       std::string path = parent + "/" + c.name;
@@ -1276,7 +1276,7 @@ struct F2fs : Mapper {
       if (isDir) walkDir(c.nid, path, visited, depth + 1);
       else if (!(c.type == F2FS_FT_SYMLINK && (mode & 0xf000) == 0xa000)) {
         std::vector<u64> b, l; inodeBlocks(ci, cInl, b, l);
-        FileRec4 r{path, false, le64(&ci[16]), b, l}; ownerOf(ci, r.uid, r.gid, r.mode); reg(std::move(r));
+        FileRec4 r{path, false, le64(&ci[16]), b, l}; r.ino = c.nid; ownerOf(ci, r.uid, r.gid, r.mode); reg(std::move(r));
       }
     }
   }
@@ -1331,7 +1331,7 @@ struct F2fs : Mapper {
     return out;
   }
   const char* fsName() const override { return "f2fs"; }
-  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)).set("uid", J::num((double)f.uid)).set("gid", J::num((double)f.gid)).set("mode", J::num((double)f.mode)); a.push(o); } return a; }
+  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)).set("ino", J::num((double)f.ino)).set("uid", J::num((double)f.uid)).set("gid", J::num((double)f.gid)).set("mode", J::num((double)f.mode)); a.push(o); } return a; }
 };
 
 // ----------------------------------------------------------------------------------------------

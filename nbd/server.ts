@@ -163,6 +163,12 @@ export interface FileMapper extends SectorMapper {
    * (whose file this is), available on ext4/f2fs. Absent on filesystems with no per-file owner (FAT32).
    */
   owner?(path: string): { uid: number; gid: number; mode: number } | undefined;
+  /**
+   * The guest path of an inode number, when the mapper indexes by inode (ext4, f2fs). Lets a
+   * kernel-reported source that names inodes rather than paths (ftrace tracepoints) be correlated
+   * back to a file. Absent on filesystems whose mapper has no inode index (FAT32).
+   */
+  pathForInode?(ino: number): string | undefined;
 }
 
 export interface NbdAccessEvent {

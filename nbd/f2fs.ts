@@ -9,6 +9,8 @@ interface FileRec {
   path: string;
   isDir: boolean;
   size: number;
+  /** The file's inode number (in f2fs the inode's node id equals its inode number). */
+  ino: number;
   /** Owner uid / gid and permission bits, from the inode (image-derived attribution). */
   uid: number;
   gid: number;
@@ -92,6 +94,8 @@ export class F2fsMapper implements FileMapper {
   private blockToFile = new Map<number, { rec: FileRec; index: number }>();
   private metadata = new Set<number>();
   files: FileRec[] = [];
+  /** Lazy inode→path index (built on first pathForInode, cleared on each parse). */
+  private inoIndex?: Map<number, string>;
 
   constructor(private readonly read: ImageReader) {
     this.parse();
@@ -153,6 +157,7 @@ export class F2fsMapper implements FileMapper {
     this.blockToFile = new Map();
     this.metadata = new Set();
     this.files = [];
+    this.inoIndex = undefined; // stale after a re-parse; rebuilt lazily by pathForInode
     // Everything before the main area (superblock, checkpoint, SIT, NAT, SSA) is metadata.
     for (let b = 0; b < mainBlkaddr; b++) this.metadata.add(b);
 
@@ -306,7 +311,7 @@ export class F2fsMapper implements FileMapper {
     const inline = inode[3]!;
     if (parentPath !== '') {
       const { blocks, logical } = this.inodeBlocks(inode, inline);
-      this.register({ path: parentPath, isDir: true, size: Number(inode.readBigUInt64LE(16)), ...ownerOfNode(inode), blocks, logical });
+      this.register({ path: parentPath, isDir: true, size: Number(inode.readBigUInt64LE(16)), ino, ...ownerOfNode(inode), blocks, logical });
     }
     for (const child of this.dirEntries(inode, inline)) {
       if (child.name === '.' || child.name === '..' || child.nid <= 0) continue;
@@ -321,7 +326,7 @@ export class F2fsMapper implements FileMapper {
       } else if (child.type !== F2FS_FT_SYMLINK || (mode & 0xf000) !== 0xa000) {
         const size = Number(childInode.readBigUInt64LE(16));
         const cb = this.inodeBlocks(childInode, cInline);
-        this.register({ path, isDir: false, size, ...ownerOfNode(childInode), blocks: cb.blocks, logical: cb.logical });
+        this.register({ path, isDir: false, size, ino: child.nid, ...ownerOfNode(childInode), blocks: cb.blocks, logical: cb.logical });
       }
     }
   }
@@ -419,6 +424,15 @@ export class F2fsMapper implements FileMapper {
   owner(path: string): { uid: number; gid: number; mode: number } | undefined {
     const rec = this.files.find((f) => f.path === path);
     return rec ? { uid: rec.uid, gid: rec.gid, mode: rec.mode } : undefined;
+  }
+
+  /** The guest path of an inode number (for correlating ftrace tracepoints, which name inodes). */
+  pathForInode(ino: number): string | undefined {
+    if (!this.inoIndex) {
+      this.inoIndex = new Map();
+      for (const f of this.files) if (!this.inoIndex.has(f.ino)) this.inoIndex.set(f.ino, f.path);
+    }
+    return this.inoIndex.get(ino);
   }
 
   /** The byte extents (offset/length pairs) a file occupies in the image, in logical order. */

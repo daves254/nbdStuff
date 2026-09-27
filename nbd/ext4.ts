@@ -153,6 +153,8 @@ export class Ext4Mapper implements FileMapper {
   private blockToFile = new Map<number, { rec: FileRec; index: number }>();
   private metadata = new Set<number>();
   files: FileRec[] = [];
+  /** Lazy inode→path index (built on first pathForInode, cleared on each parse). */
+  private inoIndex?: Map<number, string>;
 
   constructor(private readonly read: ImageReader) {
     this.parse();
@@ -186,6 +188,7 @@ export class Ext4Mapper implements FileMapper {
   // --- parsing --------------------------------------------------------------
 
   private parse(): void {
+    this.inoIndex = undefined; // stale after a re-parse; rebuilt lazily by pathForInode
     // The superblock sits at byte 1024, whatever the block size.
     const sb = this.read(1024, 1024);
     if (sb.readUInt16LE(56) !== 0xef53) throw new BlissError('Not an ext4 filesystem (bad 0xEF53 superblock magic)');
@@ -503,6 +506,15 @@ export class Ext4Mapper implements FileMapper {
   owner(path: string): { uid: number; gid: number; mode: number } | undefined {
     const rec = this.files.find((f) => f.path === path);
     return rec ? { uid: rec.uid, gid: rec.gid, mode: rec.mode } : undefined;
+  }
+
+  /** The guest path of an inode number (for correlating ftrace tracepoints, which name inodes). */
+  pathForInode(ino: number): string | undefined {
+    if (!this.inoIndex) {
+      this.inoIndex = new Map();
+      for (const f of this.files) if (!this.inoIndex.has(f.ino)) this.inoIndex.set(f.ino, f.path);
+    }
+    return this.inoIndex.get(ino);
   }
 
   /** The byte extents (offset/length pairs) a file occupies in the image, in logical order. */

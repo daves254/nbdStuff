@@ -64,6 +64,8 @@ export interface EngineFileInfo {
   path: string;
   size: number;
   isDir: boolean;
+  /** Inode number, when the mapper indexes by inode (ext4/f2fs); used to correlate ftrace events. */
+  ino?: number;
   uid?: number;
   gid?: number;
   mode?: number;
@@ -469,6 +471,7 @@ function filesOf(h: Record<string, unknown>): EngineFileInfo[] {
     path: String(f.path),
     size: Number(f.size),
     isDir: !!f.isDir,
+    ...(f.ino !== undefined ? { ino: Number(f.ino) } : {}),
     ...(f.uid !== undefined ? { uid: Number(f.uid) } : {}),
     ...(f.gid !== undefined ? { gid: Number(f.gid) } : {}),
     ...(f.mode !== undefined ? { mode: Number(f.mode) } : {}),
