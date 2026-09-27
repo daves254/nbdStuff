@@ -117,7 +117,17 @@ int main(int argc, char **argv) {
 
   int fan = fan_init(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY | O_LARGEFILE);
   if (fan < 0) {
-    fprintf(stderr, "fanotify_init: %s (need CAP_SYS_ADMIN / root)\n", strerror(errno));
+    int e = errno;
+    fprintf(stderr, "fanotify_init failed: %s (errno %d)\n", strerror(e), e);
+    if (e == ENOSYS)
+      fprintf(stderr,
+              "  ENOSYS = the syscall is unavailable here. On Android this is usually the seccomp\n"
+              "  filter of the shell/app domain masking fanotify as \"not implemented\", or a kernel\n"
+              "  built without CONFIG_FANOTIFY. Run under root/su (e.g. `su -c '%s <mount>'`), which\n"
+              "  escapes the shell seccomp filter; if it still returns ENOSYS the kernel lacks fanotify.\n",
+              argv[0]);
+    else if (e == EPERM || e == EACCES)
+      fprintf(stderr, "  Need CAP_SYS_ADMIN — run as root (`adb root`, or `su -c`).\n");
     return 1;
   }
 
