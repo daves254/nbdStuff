@@ -82,17 +82,69 @@ function toProcess(app: AppInfo): GuestProcess {
  */
 export type RedirectContent = Buffer | string | ((path: string) => Buffer | string);
 
+/** A file's current attributes, passed to a {@link FileRedirect.redirect} transform. */
+export interface CurrentFile {
+  /** Whether the file currently exists in the image. */
+  exists: boolean;
+  /** Current permission bits (`mode & 0o7777`); 0 when the file does not exist. */
+  mode: number;
+  /** Current owner uid; 0 when the file does not exist. */
+  uid: number;
+  /** Current owner gid; 0 when the file does not exist. */
+  gid: number;
+  /** Current size in bytes; 0 when the file does not exist. */
+  size: number;
+  /** The file's current bytes (read lazily; empty when it does not exist). */
+  data(): Buffer;
+}
+
+/** What a {@link FileRedirect.redirect} transform returns — every field optional (omit to keep the current value). */
+export interface RedirectSpec {
+  /** New authoritative bytes; omit to keep the file's current bytes. */
+  content?: RedirectContent;
+  /** Drop guest writes to this file. */
+  readonly?: boolean;
+  /** New permission bits (`0o755` or `'755'`). */
+  mode?: number | string;
+  /** New owner uid. */
+  ownerUID?: number;
+  /** New owner gid. */
+  ownerGID?: number;
+  /** Also mirror guest writes to this host file. */
+  mirrorTo?: string;
+}
+
+/** `mode | 0o111` — add the execute bit for user/group/other, preserving the rest. */
+export function makeExecutable(mode: number): number {
+  return (mode | 0o111) & 0o7777;
+}
+
 /**
- * A "ground truth" file: the guest sees {@link content} when it reads this path,
- * regardless of what is on the underlying image — so several VM instances can be
- * handed identical authoritative files, or a file can be overridden at runtime.
- * `content` may be a function, so the served bytes can be computed per read.
+ * A "ground truth" file: the guest sees the redirect's bytes when it reads this path, regardless of
+ * what is on the underlying image — so several VM instances can be handed identical authoritative
+ * files, or a file can be overridden at runtime. Bytes may be fixed, a function of the path, or
+ * computed from the file's current state via {@link redirect}.
+ *
+ * Give either `content` (the flat form) or `redirect` (a transform of the current attributes, so you
+ * can do `mode: makeExecutable(cur.mode)` without hard-coding the previous mode).
  */
 export interface FileRedirect {
   /** Guest path exactly as the mapper reports it (e.g. `/config.json`). */
   path: string;
-  /** Authoritative bytes served on read — fixed, or a function of the path. */
-  content: RedirectContent;
+  /** Authoritative bytes served on read — fixed, or a function of the path. Omit when using {@link redirect}. */
+  content?: RedirectContent;
+  /**
+   * A transform: given the file's {@link CurrentFile current attributes}, return the new
+   * {@link RedirectSpec}. Lets you derive the result from the previous state —
+   * `(cur) => ({ content: agent, mode: makeExecutable(cur.mode), ownerUID: cur.uid })`. Resolved at
+   * {@link listen}, so it sees the on-disk file.
+   */
+  redirect?: (current: CurrentFile) => RedirectSpec;
+  /**
+   * Create the file in the image if it does not already exist (ext4). Off by default: a redirect
+   * normally overrides an existing file, so a missing path is an error unless this is set.
+   */
+  create?: boolean;
   /** Drop guest writes to this file, keeping the ground truth immutable. */
   readonly?: boolean;
   /** Also mirror guest writes to this host file (offset-preserving). */
@@ -102,7 +154,7 @@ export interface FileRedirect {
    * can be made executable host-side, no `chmod`/`adb` needed. This rewrites the file's **inode**
    * (mode is metadata, not data, so it is applied by stamping the image at {@link listen}, not by
    * the read overlay). Supported on **ext4** images with a writable base and no layers; FAT32 has no
-   * per-file mode (use the mount's `uid`/`fmask`). The file must already exist in the image.
+   * per-file mode (use the mount's `uid`/`fmask`). The file must already exist (or `create: true`).
    */
   mode?: number | string;
   /** Set the file's owner uid in the guest (ext4 inode; same rules as {@link mode}). */
@@ -606,6 +658,8 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   private attrTimer?: ReturnType<typeof setInterval>;
   /** Accurate caller attribution from a kernel-reported source (see {@link trackCaller}). */
   private callerTracker?: GuestCallerTracker;
+  /** Redirects given as a transform of the current file; resolved against the image at listen(). */
+  private readonly transformRedirects = new Map<string, FileRedirect>();
 
   constructor(opts: NbdFileShareOptions) {
     super();
@@ -628,6 +682,17 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
 
   /** Add or replace a ground-truth / redirect file (safe before or after listen). */
   setRedirect(r: FileRedirect): void {
+    // Transform form: resolved against the on-disk file at listen() (or now, if already listening),
+    // then applied through the flat form below.
+    if (r.redirect) {
+      if (r.content !== undefined) throw new BlissError(`redirect ${r.path}: give either content or redirect, not both`);
+      this.transformRedirects.set(r.path, r);
+      if (this.base && this.mapper instanceof Ext4Mapper) this.resolveTransformRedirects(); // already listening (js)
+      else if (this.native) this.log.warn(`redirect ${r.path}: transform applies at the next listen() (the native engine holds the image while running)`);
+      return;
+    }
+    if (r.content === undefined) throw new BlissError(`redirect ${r.path}: needs content or a redirect transform`);
+    if (r.create) throw new BlissError(`redirect ${r.path}: create is not yet supported — the file must already exist in the image (create it once in the guest, or ask for host-side ext4 create)`);
     if (this.engine === 'cpp' && typeof r.content === 'function') {
       throw new BlissError(`redirect ${r.path}: a content FUNCTION runs in Node on every read, which only the in-process engine can do — pass fixed bytes, or use { engine: "js" }`);
     }
@@ -967,47 +1032,105 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       this.log.warn('NbdFileShare: redirect mode/owner will apply at the next listen() (the native engine holds the image while running)');
       return;
     }
-    let backend: NbdBackend;
-    let mapper: Ext4Mapper;
-    let opened: FileBackend | undefined;
-    if (this.base && this.mapper instanceof Ext4Mapper) {
-      backend = this.base;
-      mapper = this.mapper;
-    } else {
-      if (this.opts.layers?.length) throw new BlissError('redirect mode/owner with layers must be applied while listening on the in-process engine');
-      const fb = new FileBackend(this.opts.image, { ...(this.opts.size ? { size: this.opts.size } : {}) });
-      if (fb.readonly) { fb.close(); throw new BlissError('redirect mode/owner: the base image is read-only'); }
-      try {
-        mapper = Ext4Mapper.fromBackend(fb);
-      } catch (e) {
-        fb.close();
-        throw new BlissError(`redirect mode/owner needs an ext4 image (${(e as Error).message}) — FAT32 has no per-file mode; use the mount uid/fmask`);
-      }
-      backend = fb;
-      opened = fb;
-    }
+    const img = this.acquireExt4();
+    if (!img) return;
     try {
-      const info = mapper.csumInfo();
+      const info = img.mapper.csumInfo();
       for (const [path, r] of stamps) {
-        const loc = mapper.inodeLocation(path);
+        const loc = img.mapper.inodeLocation(path);
         if (!loc) {
           this.log.warn(`NbdFileShare: redirect ${path} is not a file in the image — cannot set mode/owner`);
           continue;
         }
-        const inode = backend.read(loc.offset, loc.size) as Buffer;
+        const inode = img.backend.read(loc.offset, loc.size) as Buffer;
         const patched = patchExt4Inode(inode, loc.ino, {
           ...(r.mode !== undefined ? { mode: r.mode } : {}),
           ...(r.ownerUID !== undefined ? { uid: r.ownerUID } : {}),
           ...(r.ownerGID !== undefined ? { gid: r.ownerGID } : {}),
         }, info);
-        backend.write(loc.offset, patched);
+        img.backend.write(loc.offset, patched);
         this.log.info(
           `NbdFileShare: ${path} ${[r.mode !== undefined ? `mode 0${r.mode.toString(8)}` : '', r.ownerUID !== undefined ? `uid ${r.ownerUID}` : '', r.ownerGID !== undefined ? `gid ${r.ownerGID}` : ''].filter(Boolean).join(' ')}`,
         );
       }
-      void backend.flush?.();
+      void img.backend.flush?.();
     } finally {
-      opened?.close();
+      img.release();
+    }
+  }
+
+  /**
+   * The ext4 image to read/patch inode metadata through: the live backend while listening (writes
+   * land in the top layer, composed correctly), else the image file opened directly. Returns
+   * undefined when the image doesn't exist yet; throws when it exists but isn't a writable ext4.
+   */
+  private acquireExt4(): { backend: NbdBackend; mapper: Ext4Mapper; release: () => void } | undefined {
+    if (this.base && this.mapper instanceof Ext4Mapper) return { backend: this.base, mapper: this.mapper, release: () => undefined };
+    if (this.opts.layers?.length) throw new BlissError('redirect mode/owner/transform with layers must be applied while listening on the in-process engine');
+    if (!existsSync(this.opts.image)) return undefined;
+    const fb = new FileBackend(this.opts.image, { ...(this.opts.size ? { size: this.opts.size } : {}) });
+    if (fb.readonly) { fb.close(); throw new BlissError('redirect mode/owner: the base image is read-only'); }
+    let mapper: Ext4Mapper;
+    try {
+      mapper = Ext4Mapper.fromBackend(fb);
+    } catch (e) {
+      fb.close();
+      throw new BlissError(`redirect mode/owner/transform needs an ext4 image (${(e as Error).message}) — FAT32 has no per-file mode; use the mount uid/fmask`);
+    }
+    return { backend: fb, mapper, release: () => fb.close() };
+  }
+
+  /** Read a file's current bytes (whole file) through a mapper + backend. */
+  private readFileBytes(mapper: Ext4Mapper, backend: NbdBackend, path: string, size: number): Buffer {
+    if (size <= 0) return Buffer.alloc(0);
+    const out = Buffer.alloc(size);
+    let written = 0;
+    for (const e of mapper.extents(path)) {
+      if (written >= size) break;
+      const take = Math.min(e.length, size - written);
+      (backend.read(e.offset, e.length) as Buffer).copy(out, written, 0, take);
+      written += take;
+    }
+    return out;
+  }
+
+  /**
+   * Resolve any {@link FileRedirect.redirect} transforms against the on-disk file — read the current
+   * attributes/bytes, call the transform, and apply the returned spec through the flat form.
+   */
+  private resolveTransformRedirects(): void {
+    if (this.transformRedirects.size === 0) return;
+    const img = this.acquireExt4();
+    if (!img) throw new BlissError('redirect transform: the image does not exist yet');
+    try {
+      for (const [path, fr] of [...this.transformRedirects]) {
+        const attrs = img.mapper.inodeAttrs(path);
+        if (!attrs) {
+          if (fr.create) throw new BlissError(`redirect ${path}: create is not yet supported — create the file once in the guest first`);
+          throw new BlissError(`redirect ${path}: file does not exist in the image (create it first, or pass create: true once supported)`);
+        }
+        const current: CurrentFile = {
+          exists: true,
+          mode: attrs.mode,
+          uid: attrs.uid,
+          gid: attrs.gid,
+          size: attrs.size,
+          data: () => this.readFileBytes(img.mapper, img.backend, path, attrs.size),
+        };
+        const spec = fr.redirect!(current);
+        this.transformRedirects.delete(path);
+        this.setRedirect({
+          path,
+          content: spec.content ?? current.data(),
+          ...(spec.readonly !== undefined ? { readonly: spec.readonly } : {}),
+          ...(spec.mode !== undefined ? { mode: spec.mode } : {}),
+          ...(spec.ownerUID !== undefined ? { ownerUID: spec.ownerUID } : {}),
+          ...(spec.ownerGID !== undefined ? { ownerGID: spec.ownerGID } : {}),
+          ...(spec.mirrorTo ? { mirrorTo: spec.mirrorTo } : {}),
+        });
+      }
+    } finally {
+      img.release();
     }
   }
 
@@ -1034,7 +1157,9 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     // raw block share (no file-name events) rather than throwing. FAT32 and ext4 are both mapped.
     this.mapper = this.buildMapper(this.base);
     if (this.mapper) this.prev = this.snapshot();
-    // Stamp redirect mode/owner into the inode before serving, so the guest never reads a pre-stamp mode.
+    // Resolve transform redirects against the on-disk file, then stamp mode/owner into the inode
+    // before serving, so the guest never reads a pre-stamp mode.
+    this.resolveTransformRedirects();
     this.applyMetadataStamps();
     try {
       for (const [id, spec] of this.contextLayers) await this.openContextLayer(id, spec);
@@ -1082,8 +1207,9 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   /** The native engine: everything on the block path runs in its process; Node keeps the control plane. */
   private async listenNative(): Promise<{ port: number; driveFile: string }> {
     if (!NbdEngine.available()) throw new BlissError(NbdEngine.missingMessage());
-    // Stamp redirect mode/owner into the image before the engine opens it (this.native is not set
-    // yet, so this takes the offline path and edits the image file directly).
+    // Resolve transforms and stamp mode/owner into the image before the engine opens it (this.native
+    // is not set yet, so these take the offline path and edit the image file directly).
+    this.resolveTransformRedirects();
     this.applyMetadataStamps();
     const engine = await NbdEngine.start({ log: this.log });
     engine.on('access', (e: NbdAccessEvent) => this.onAccess(e));

@@ -502,6 +502,20 @@ export class Ext4Mapper implements FileMapper {
     return rec.blocks.map((b) => ({ offset: b * this.geo.blockSize, length: this.geo.blockSize }));
   }
 
+  /** A file's current inode attributes: permission bits, owner uid/gid, and size. */
+  inodeAttrs(path: string): { mode: number; uid: number; gid: number; size: number } | undefined {
+    const rec = this.files.find((f) => f.path === path);
+    if (!rec) return undefined;
+    const inode = this.readInode(rec.ino);
+    if (!inode) return undefined;
+    return {
+      mode: inode.readUInt16LE(0) & 0o7777, // permission bits (type bits stripped)
+      uid: inode.readUInt16LE(2) | (inode.readUInt16LE(120) << 16),
+      gid: inode.readUInt16LE(24) | (inode.readUInt16LE(122) << 16),
+      size: inode.readUInt32LE(4) + inode.readUInt32LE(108) * 0x1_0000_0000,
+    };
+  }
+
   /** The byte offset + size of a file's inode in the image (for rewriting its mode/owner). */
   inodeLocation(path: string): { offset: number; size: number; ino: number } | undefined {
     const rec = this.files.find((f) => f.path === path);
