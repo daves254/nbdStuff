@@ -9,10 +9,80 @@ interface FileRec {
   path: string;
   isDir: boolean;
   size: number;
+  /** The file's inode number. */
+  ino: number;
   /** Physical blocks in logical order (index i = the file's logical block i). */
   blocks: number[];
   /** The logical block number each entry of {@link blocks} stands for (holes leave gaps). */
   logical: number[];
+}
+
+/** Enough of the superblock to recompute an inode's metadata_csum when rewriting mode/owner. */
+export interface Ext4CsumInfo {
+  inodeSize: number;
+  /** The seed crc32c(~0, uuid) — or the explicit s_checksum_seed when the fs stores one. */
+  csumSeed: number;
+  /** Whether metadata_csum is on (an inode checksum must be written when it is). */
+  metadataCsum: boolean;
+}
+
+// crc32c (Castagnoli, reflected) — the checksum ext4's metadata_csum uses.
+const CRC32C_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0x82f63b78 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32c(seed: number, buf: Buffer): number {
+  let c = seed >>> 0;
+  for (let i = 0; i < buf.length; i++) c = (CRC32C_TABLE[(c ^ buf[i]!) & 0xff]! ^ (c >>> 8)) >>> 0;
+  return c >>> 0;
+}
+
+/**
+ * Rewrite an ext4 inode's mode / owner uid / owner gid in place and fix its metadata_csum, returning
+ * the patched inode bytes. `mode` keeps the file-type bits and replaces the permission bits. Pure and
+ * exported so it can be unit-tested against e2fsck.
+ */
+export function patchExt4Inode(
+  inode: Buffer,
+  ino: number,
+  changes: { mode?: number; uid?: number; gid?: number },
+  info: Ext4CsumInfo,
+): Buffer {
+  const out = Buffer.from(inode);
+  if (changes.mode !== undefined) {
+    const type = out.readUInt16LE(0) & 0xf000;
+    out.writeUInt16LE((type | (changes.mode & 0x0fff)) & 0xffff, 0);
+  }
+  if (changes.uid !== undefined) {
+    out.writeUInt16LE(changes.uid & 0xffff, 2);
+    out.writeUInt16LE((changes.uid >>> 16) & 0xffff, 120); // l_i_uid_high
+  }
+  if (changes.gid !== undefined) {
+    out.writeUInt16LE(changes.gid & 0xffff, 24);
+    out.writeUInt16LE((changes.gid >>> 16) & 0xffff, 122); // l_i_gid_high
+  }
+  if (info.metadataCsum) {
+    const extraIsize = info.inodeSize > 128 ? out.readUInt16LE(128) : 0;
+    const hasHi = info.inodeSize > 128 && extraIsize >= 0x82 + 2 - 128; // room for i_checksum_hi
+    const work = Buffer.from(out);
+    work.writeUInt16LE(0, 124); // l_i_checksum_lo
+    if (hasHi) work.writeUInt16LE(0, 130); // i_checksum_hi
+    const inumB = Buffer.alloc(4);
+    inumB.writeUInt32LE(ino >>> 0, 0);
+    const genB = Buffer.alloc(4);
+    genB.writeUInt32LE(out.readUInt32LE(100) >>> 0, 0); // i_generation
+    let c = crc32c(info.csumSeed, inumB);
+    c = crc32c(c, genB);
+    c = crc32c(c, work);
+    out.writeUInt16LE(c & 0xffff, 124);
+    if (hasHi) out.writeUInt16LE((c >>> 16) & 0xffff, 130);
+  }
+  return out;
 }
 
 interface Geometry {
@@ -27,7 +97,14 @@ interface Geometry {
   is64bit: boolean;
   hasFileType: boolean;
   groups: number;
+  /** metadata_csum is on (an inode's checksum must be recomputed when its inode is rewritten). */
+  metadataCsum: boolean;
+  /** Seed for the inode checksum: crc32c(~0, uuid), or s_checksum_seed when the fs stores one. */
+  csumSeed: number;
 }
+
+const RO_COMPAT_METADATA_CSUM = 0x0400;
+const INCOMPAT_CSUM_SEED = 0x2000;
 
 // Inode i_mode top nibble.
 const S_IFMT = 0xf000;
@@ -132,6 +209,10 @@ export class Ext4Mapper implements FileMapper {
     const groups = Math.ceil(blocksCount / blocksPerGroup);
     if (groups <= 0 || groups > 1 << 24) throw new BlissError('Not an ext4 filesystem (implausible group count)');
 
+    const featureRoCompat = sb.readUInt32LE(100);
+    const metadataCsum = (featureRoCompat & RO_COMPAT_METADATA_CSUM) !== 0;
+    const csumSeed = (featureIncompat & INCOMPAT_CSUM_SEED) !== 0 ? sb.readUInt32LE(0x270) >>> 0 : crc32c(0xffffffff, sb.subarray(104, 120));
+
     this.geo = {
       blockSize,
       blocksPerGroup,
@@ -144,6 +225,8 @@ export class Ext4Mapper implements FileMapper {
       is64bit,
       hasFileType,
       groups,
+      metadataCsum,
+      csumSeed,
     };
 
     this.readGroupDescriptors();
@@ -193,16 +276,22 @@ export class Ext4Mapper implements FileMapper {
     return this.read(block * this.geo.blockSize, this.geo.blockSize);
   }
 
-  /** The raw inode bytes for a 1-based inode number, or undefined when it is out of range. */
-  private readInode(ino: number): Buffer | undefined {
+  /** The byte offset of a 1-based inode number in the image, or undefined when out of range. */
+  private inodeOffset(ino: number): number | undefined {
     const { inodesPerGroup, inodeSize, blockSize, inodesCount } = this.geo;
     if (ino < 1 || ino > inodesCount) return undefined;
     const group = Math.floor((ino - 1) / inodesPerGroup);
     const index = (ino - 1) % inodesPerGroup;
     const tableBlock = this.inodeTableBlock[group];
     if (tableBlock === undefined) return undefined;
-    const offset = tableBlock * blockSize + index * inodeSize;
-    return this.read(offset, inodeSize);
+    return tableBlock * blockSize + index * inodeSize;
+  }
+
+  /** The raw inode bytes for a 1-based inode number, or undefined when it is out of range. */
+  private readInode(ino: number): Buffer | undefined {
+    const offset = this.inodeOffset(ino);
+    if (offset === undefined) return undefined;
+    return this.read(offset, this.geo.inodeSize);
   }
 
   /**
@@ -330,7 +419,7 @@ export class Ext4Mapper implements FileMapper {
     const { blocks, logical } = this.inodeBlocks(inode);
     if (parentPath !== '') {
       // Record the directory's own blocks so metadata writes to it map to the directory.
-      this.register({ path: parentPath, isDir: true, size: inode.readUInt32LE(4), blocks, logical });
+      this.register({ path: parentPath, isDir: true, size: inode.readUInt32LE(4), ino, blocks, logical });
     }
     const dirData = this.readAll(blocks);
     // A directory's entries are a per-block linked list of ext4_dir_entry_2; walking the whole data
@@ -361,7 +450,7 @@ export class Ext4Mapper implements FileMapper {
                 const sizeHi = child.readUInt32LE(108);
                 const size = sizeLo + sizeHi * 0x1_0000_0000;
                 const cb = this.inodeBlocks(child);
-                this.register({ path, isDir: false, size, blocks: cb.blocks, logical: cb.logical });
+                this.register({ path, isDir: false, size, ino: childIno, blocks: cb.blocks, logical: cb.logical });
               }
             }
           }
@@ -411,6 +500,20 @@ export class Ext4Mapper implements FileMapper {
     const rec = this.files.find((f) => f.path === path);
     if (!rec) return [];
     return rec.blocks.map((b) => ({ offset: b * this.geo.blockSize, length: this.geo.blockSize }));
+  }
+
+  /** The byte offset + size of a file's inode in the image (for rewriting its mode/owner). */
+  inodeLocation(path: string): { offset: number; size: number; ino: number } | undefined {
+    const rec = this.files.find((f) => f.path === path);
+    if (!rec) return undefined;
+    const offset = this.inodeOffset(rec.ino);
+    if (offset === undefined) return undefined;
+    return { offset, size: this.geo.inodeSize, ino: rec.ino };
+  }
+
+  /** What {@link patchExt4Inode} needs to recompute an inode's checksum for this filesystem. */
+  csumInfo(): Ext4CsumInfo {
+    return { inodeSize: this.geo.inodeSize, csumSeed: this.geo.csumSeed, metadataCsum: this.geo.metadataCsum };
   }
 }
 

@@ -5,7 +5,7 @@ import { dirname } from 'node:path';
 import { FileBackend, NbdServer } from './server';
 import type { FileMapper, NbdAccessEvent, NbdBackend, TouchedFile } from './server';
 import { Fat32Mapper } from './fat32';
-import { Ext4Mapper } from './ext4';
+import { Ext4Mapper, patchExt4Inode } from './ext4';
 import { F2fsMapper } from './f2fs';
 import { GuestCallerTracker, FanotifyCallerSource } from './caller';
 import type { CallerRecord, CallerSource } from './caller';
@@ -97,6 +97,18 @@ export interface FileRedirect {
   readonly?: boolean;
   /** Also mirror guest writes to this host file (offset-preserving). */
   mirrorTo?: string;
+  /**
+   * Set the file's permission bits in the guest, e.g. `0o755` or `'755'` — so a redirected binary
+   * can be made executable host-side, no `chmod`/`adb` needed. This rewrites the file's **inode**
+   * (mode is metadata, not data, so it is applied by stamping the image at {@link listen}, not by
+   * the read overlay). Supported on **ext4** images with a writable base and no layers; FAT32 has no
+   * per-file mode (use the mount's `uid`/`fmask`). The file must already exist in the image.
+   */
+  mode?: number | string;
+  /** Set the file's owner uid in the guest (ext4 inode; same rules as {@link mode}). */
+  ownerUID?: number;
+  /** Set the file's owner gid in the guest (ext4 inode; same rules as {@link mode}). */
+  ownerGID?: number;
 }
 
 export type AppAttributor = (path: string, share: NbdFileShare) => Promise<AppInfo | undefined>;
@@ -287,6 +299,12 @@ export interface ResolvedRedirect {
   mirrorTo?: string;
   /** Its open fd, while the in-process engine is serving. */
   mirrorFd?: number;
+  /** Guest inode permission bits to stamp (ext4), if any. */
+  mode?: number;
+  /** Guest inode owner uid to stamp (ext4), if any. */
+  ownerUID?: number;
+  /** Guest inode owner gid to stamp (ext4), if any. */
+  ownerGID?: number;
 }
 
 /** Open a mirror file for positional writes — never append mode, which ignores the offset. */
@@ -622,8 +640,21 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     // The native engine mirrors in its own process; Node opens the file only when it serves the
     // block path itself (and only while it does — listen() opens, close() closes).
     const mirrorFd = r.mirrorTo && this.engine === 'js' && this.listening ? this.tryOpenMirror(r.path, r.mirrorTo) : undefined;
-    const entry: ResolvedRedirect = { content, readonly: !!r.readonly, ...(r.mirrorTo ? { mirrorTo: r.mirrorTo } : {}), mirrorFd };
+    // mode may be '755' / '0755' (octal string) or a number (0o755).
+    const mode = r.mode === undefined ? undefined : typeof r.mode === 'string' ? parseInt(r.mode, 8) : r.mode;
+    if (mode !== undefined && (!Number.isFinite(mode) || mode < 0 || mode > 0o7777)) throw new BlissError(`redirect ${r.path}: invalid mode ${r.mode}`);
+    const entry: ResolvedRedirect = {
+      content,
+      readonly: !!r.readonly,
+      ...(r.mirrorTo ? { mirrorTo: r.mirrorTo } : {}),
+      mirrorFd,
+      ...(mode !== undefined ? { mode } : {}),
+      ...(r.ownerUID !== undefined ? { ownerUID: r.ownerUID } : {}),
+      ...(r.ownerGID !== undefined ? { ownerGID: r.ownerGID } : {}),
+    };
     this.redirects.set(r.path, entry);
+    // Inode mode/owner is applied by stamping the image at listen(); when already listening, do it now.
+    if ((mode !== undefined || r.ownerUID !== undefined || r.ownerGID !== undefined) && this.listening) this.applyMetadataStamps();
     if (this.native) {
       const native = this.native;
       const apply = (withMirror: boolean) =>
@@ -922,6 +953,64 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     return undefined;
   }
 
+  /**
+   * Apply any redirect `mode` / `ownerUID` / `ownerGID` by rewriting the file's ext4 inode (with a
+   * corrected metadata_csum) — so a redirected binary can be made executable host-side with no
+   * `chmod`/`adb`. Uses the live backend while listening (writes land in the top layer, composed
+   * correctly), or opens the image directly otherwise. ext4 only; FAT32 has no per-file mode.
+   */
+  private applyMetadataStamps(): void {
+    const stamps = [...this.redirects.entries()].filter(([, r]) => r.mode !== undefined || r.ownerUID !== undefined || r.ownerGID !== undefined);
+    if (!stamps.length) return;
+    // The native engine holds the image in its own process while running; stamp on the next listen().
+    if (this.native) {
+      this.log.warn('NbdFileShare: redirect mode/owner will apply at the next listen() (the native engine holds the image while running)');
+      return;
+    }
+    let backend: NbdBackend;
+    let mapper: Ext4Mapper;
+    let opened: FileBackend | undefined;
+    if (this.base && this.mapper instanceof Ext4Mapper) {
+      backend = this.base;
+      mapper = this.mapper;
+    } else {
+      if (this.opts.layers?.length) throw new BlissError('redirect mode/owner with layers must be applied while listening on the in-process engine');
+      const fb = new FileBackend(this.opts.image, { ...(this.opts.size ? { size: this.opts.size } : {}) });
+      if (fb.readonly) { fb.close(); throw new BlissError('redirect mode/owner: the base image is read-only'); }
+      try {
+        mapper = Ext4Mapper.fromBackend(fb);
+      } catch (e) {
+        fb.close();
+        throw new BlissError(`redirect mode/owner needs an ext4 image (${(e as Error).message}) — FAT32 has no per-file mode; use the mount uid/fmask`);
+      }
+      backend = fb;
+      opened = fb;
+    }
+    try {
+      const info = mapper.csumInfo();
+      for (const [path, r] of stamps) {
+        const loc = mapper.inodeLocation(path);
+        if (!loc) {
+          this.log.warn(`NbdFileShare: redirect ${path} is not a file in the image — cannot set mode/owner`);
+          continue;
+        }
+        const inode = backend.read(loc.offset, loc.size) as Buffer;
+        const patched = patchExt4Inode(inode, loc.ino, {
+          ...(r.mode !== undefined ? { mode: r.mode } : {}),
+          ...(r.ownerUID !== undefined ? { uid: r.ownerUID } : {}),
+          ...(r.ownerGID !== undefined ? { gid: r.ownerGID } : {}),
+        }, info);
+        backend.write(loc.offset, patched);
+        this.log.info(
+          `NbdFileShare: ${path} ${[r.mode !== undefined ? `mode 0${r.mode.toString(8)}` : '', r.ownerUID !== undefined ? `uid ${r.ownerUID}` : '', r.ownerGID !== undefined ? `gid ${r.ownerGID}` : ''].filter(Boolean).join(' ')}`,
+        );
+      }
+      void backend.flush?.();
+    } finally {
+      opened?.close();
+    }
+  }
+
   /** Start the NBD server. The VM calls this automatically before boot. */
   async listen(): Promise<{ port: number; driveFile: string }> {
     if (this.listening) return { port: this.nbdPort, driveFile: this.driveFile() };
@@ -945,6 +1034,8 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     // raw block share (no file-name events) rather than throwing. FAT32 and ext4 are both mapped.
     this.mapper = this.buildMapper(this.base);
     if (this.mapper) this.prev = this.snapshot();
+    // Stamp redirect mode/owner into the inode before serving, so the guest never reads a pre-stamp mode.
+    this.applyMetadataStamps();
     try {
       for (const [id, spec] of this.contextLayers) await this.openContextLayer(id, spec);
       for (const [path, r] of this.redirects) if (r.mirrorTo && r.mirrorFd === undefined) r.mirrorFd = this.tryOpenMirror(path, r.mirrorTo);
@@ -991,6 +1082,9 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   /** The native engine: everything on the block path runs in its process; Node keeps the control plane. */
   private async listenNative(): Promise<{ port: number; driveFile: string }> {
     if (!NbdEngine.available()) throw new BlissError(NbdEngine.missingMessage());
+    // Stamp redirect mode/owner into the image before the engine opens it (this.native is not set
+    // yet, so this takes the offline path and edits the image file directly).
+    this.applyMetadataStamps();
     const engine = await NbdEngine.start({ log: this.log });
     engine.on('access', (e: NbdAccessEvent) => this.onAccess(e));
     engine.on('exit', () => {
