@@ -22,12 +22,8 @@ jobs:
         include:
           - abi: x86_64          # Android-x86 / BlissOS
             triple: x86_64-linux-android
-          - abi: arm64-v8a       # most ARM devices
+          - abi: arm64-v8a       # 64-bit ARM devices
             triple: aarch64-linux-android
-          - abi: x86
-            triple: i686-linux-android
-          - abi: armeabi-v7a
-            triple: armv7a-linux-androideabi
     env:
       API: '24' # bionic has fanotify well before this; any API <= your device works
     steps:

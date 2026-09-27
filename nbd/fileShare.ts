@@ -1711,16 +1711,20 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   }
 
   /**
-   * {@link trackCaller} with a {@link FanotifyCallerSource} over the bound device, watching this
-   * share's guest mount points. Needs the share mounted ({@link mountInGuest}) and the fanotify
-   * agent present in the guest at `agentPath` (defaults to the {@link
-   * NbdFileShareOptions.callerAgentPath} option).
+   * {@link trackCaller} with a {@link FanotifyCallerSource} over the bound device. `mounts` is the
+   * guest mount point(s) to watch; it defaults to this share's {@link mountInGuest} points, but when
+   * the guest mounts the image itself — e.g. BlissVM `persistData` puts the image on `/data` — pass
+   * the real mount (`{ mounts: ['/data'] }`), since the share never called `mountInGuest`. One
+   * `FAN_MARK_MOUNT` on `/data` reports every write anywhere under it with its caller. Needs the
+   * fanotify agent present in the guest at `agentPath` (defaults to {@link
+   * NbdFileShareOptions.callerAgentPath}).
    */
-  async trackCallerViaFanotify(agentPath: string | undefined = this.opts.callerAgentPath): Promise<void> {
+  async trackCallerViaFanotify(opts: { agentPath?: string; mounts?: string[] } = {}): Promise<void> {
     if (!this.device) throw new BlissError('trackCallerViaFanotify needs a bound device — attach the share to a VM');
-    if (!agentPath) throw new BlissError('trackCallerViaFanotify needs the guest agent path (the callerAgentPath option or the argument)');
-    const mounts = this.mountPoints();
-    if (!mounts.length) throw new BlissError('trackCallerViaFanotify: mount the share in the guest first (mountInGuest)');
+    const agentPath = opts.agentPath ?? this.opts.callerAgentPath;
+    if (!agentPath) throw new BlissError('trackCallerViaFanotify needs the guest agent path (the callerAgentPath option or opts.agentPath)');
+    const mounts = opts.mounts?.length ? opts.mounts : this.mountPoints();
+    if (!mounts.length) throw new BlissError('trackCallerViaFanotify: no mount to watch — pass { mounts: ["/data"] } (or mount the share first with mountInGuest)');
     await this.trackCaller(new FanotifyCallerSource(this.device.adb, { mounts, agentPath }));
   }
 

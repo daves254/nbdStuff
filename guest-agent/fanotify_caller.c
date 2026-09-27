@@ -22,18 +22,40 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+// fanotify constants / struct: from <sys/fanotify.h> where it exists (glibc, musl), otherwise from
+// the kernel UAPI header. The Android NDK (bionic) ships <linux/fanotify.h> but NOT <sys/fanotify.h>,
+// so detect it. A second guarded include covers the rare libc whose <sys/fanotify.h> omits the
+// FAN_EVENT_* macros (musl defines them itself, so its build never re-includes the UAPI header,
+// which musl's sysroot doesn't carry).
+#if defined(__has_include)
+#if __has_include(<sys/fanotify.h>)
 #include <sys/fanotify.h>
-// FAN_EVENT_OK/NEXT, FANOTIFY_METADATA_VERSION and struct fanotify_event_metadata come from the
-// kernel UAPI header. glibc and bionic's <sys/fanotify.h> pull it in; musl defines them itself and
-// does not ship the UAPI header in its sysroot — so only include it when the macros are still
-// missing. This keeps the Android NDK, glibc and musl builds all compiling with no edits.
+#else
+#include <linux/fanotify.h>
+#endif
+#else
+#include <sys/fanotify.h>
+#endif
 #ifndef FAN_EVENT_OK
 #include <linux/fanotify.h>
 #endif
-#include <unistd.h>
+
+// Invoke the syscalls directly, depending on neither the libc wrapper nor <sys/fanotify.h> (which
+// bionic lacks). 64-bit only — the u64 mask is a single register there; the CI builds x86_64 and
+// arm64-v8a, the ABIs Android actually runs.
+static int fan_init(unsigned int flags, unsigned int event_f_flags) {
+  return (int)syscall(__NR_fanotify_init, flags, event_f_flags);
+}
+static int fan_mark(int fd, unsigned int flags, uint64_t mask, int dfd, const char *path) {
+  return (int)syscall(__NR_fanotify_mark, fd, flags, mask, dfd, path);
+}
 
 static long g_self_pid;
 
@@ -93,7 +115,7 @@ int main(int argc, char **argv) {
   }
   g_self_pid = (long)getpid();
 
-  int fan = fanotify_init(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY | O_LARGEFILE);
+  int fan = fan_init(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY | O_LARGEFILE);
   if (fan < 0) {
     fprintf(stderr, "fanotify_init: %s (need CAP_SYS_ADMIN / root)\n", strerror(errno));
     return 1;
@@ -102,7 +124,7 @@ int main(int argc, char **argv) {
   int marked = 0;
   for (int i = 1; i < argc; i++) {
     // Watch the whole mount; report writes and write-closes with the causing process.
-    if (fanotify_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_MODIFY | FAN_CLOSE_WRITE, AT_FDCWD, argv[i]) == 0) {
+    if (fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_MODIFY | FAN_CLOSE_WRITE, AT_FDCWD, argv[i]) == 0) {
       marked++;
     } else {
       fprintf(stderr, "fanotify_mark %s: %s\n", argv[i], strerror(errno));
