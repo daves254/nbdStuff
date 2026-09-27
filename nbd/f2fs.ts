@@ -9,6 +9,10 @@ interface FileRec {
   path: string;
   isDir: boolean;
   size: number;
+  /** Owner uid / gid and permission bits, from the inode (image-derived attribution). */
+  uid: number;
+  gid: number;
+  mode: number;
   /** Physical blocks in logical order. */
   blocks: number[];
   /** The file's logical block index for each entry of {@link blocks} (holes leave gaps). */
@@ -302,7 +306,7 @@ export class F2fsMapper implements FileMapper {
     const inline = inode[3]!;
     if (parentPath !== '') {
       const { blocks, logical } = this.inodeBlocks(inode, inline);
-      this.register({ path: parentPath, isDir: true, size: Number(inode.readBigUInt64LE(16)), blocks, logical });
+      this.register({ path: parentPath, isDir: true, size: Number(inode.readBigUInt64LE(16)), ...ownerOfNode(inode), blocks, logical });
     }
     for (const child of this.dirEntries(inode, inline)) {
       if (child.name === '.' || child.name === '..' || child.nid <= 0) continue;
@@ -317,7 +321,7 @@ export class F2fsMapper implements FileMapper {
       } else if (child.type !== F2FS_FT_SYMLINK || (mode & 0xf000) !== 0xa000) {
         const size = Number(childInode.readBigUInt64LE(16));
         const cb = this.inodeBlocks(childInode, cInline);
-        this.register({ path, isDir: false, size, blocks: cb.blocks, logical: cb.logical });
+        this.register({ path, isDir: false, size, ...ownerOfNode(childInode), blocks: cb.blocks, logical: cb.logical });
       }
     }
   }
@@ -411,12 +415,23 @@ export class F2fsMapper implements FileMapper {
     return this.files.map((f) => ({ path: f.path, size: f.size, isDir: f.isDir }));
   }
 
+  /** The file's owner uid / gid and permission bits (image-derived attribution). */
+  owner(path: string): { uid: number; gid: number; mode: number } | undefined {
+    const rec = this.files.find((f) => f.path === path);
+    return rec ? { uid: rec.uid, gid: rec.gid, mode: rec.mode } : undefined;
+  }
+
   /** The byte extents (offset/length pairs) a file occupies in the image, in logical order. */
   extents(path: string): Array<{ offset: number; length: number }> {
     const rec = this.files.find((f) => f.path === path);
     if (!rec) return [];
     return rec.blocks.map((b) => ({ offset: b * this.geo.blockSize, length: this.geo.blockSize }));
   }
+}
+
+/** Owner uid / gid and permission bits from an f2fs inode node buffer. */
+function ownerOfNode(inode: Buffer): { uid: number; gid: number; mode: number } {
+  return { uid: inode.readUInt32LE(4), gid: inode.readUInt32LE(8), mode: inode.readUInt16LE(0) & 0o7777 };
 }
 
 function pushMerged(out: TouchedFile[], t: TouchedFile): void {

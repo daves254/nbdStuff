@@ -158,6 +158,11 @@ export interface FileMapper extends SectorMapper {
   refresh(): void;
   /** The byte extents (offset/length pairs) a file occupies in the image. */
   extents(path: string): Array<{ offset: number; length: number }>;
+  /**
+   * The file's owner uid / gid and permission bits, read from the inode — image-derived attribution
+   * (whose file this is), available on ext4/f2fs. Absent on filesystems with no per-file owner (FAT32).
+   */
+  owner?(path: string): { uid: number; gid: number; mode: number } | undefined;
 }
 
 export interface NbdAccessEvent {

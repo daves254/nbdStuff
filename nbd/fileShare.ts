@@ -14,7 +14,7 @@ import { BlissError } from '../errors';
 import { GuestProcess, guestProcess } from '../guestProcess';
 import type { DriveConfig, Logger } from '../types';
 import { CowLayer, LayerStack, type LayerInfo, type LayerSpec } from './layers';
-import { NbdEngine, resolveNbdEngine, type NbdEngineKind } from './engine';
+import { NbdEngine, resolveNbdEngine, type NbdEngineKind, type EngineFileInfo } from './engine';
 
 /**
  * The app/process the guest attributes a file operation to. Best-effort: NBD is
@@ -31,6 +31,21 @@ export interface AppInfo {
   process?: string;
 }
 
+/**
+ * The image-derived owner of a file: the uid / gid / permission bits stored in its inode
+ * (ext4, f2fs). This is *whose file it is*, not *who wrote it* — it always resolves from the block
+ * image alone, with no guest agent, so it is the reliable fallback when accurate caller attribution
+ * (fanotify) is unavailable. Absent for filesystems with no ownership concept (FAT32).
+ */
+export interface FileOwner {
+  /** Owner uid from the inode. */
+  uid: number;
+  /** Owner gid from the inode. */
+  gid: number;
+  /** Permission bits (`mode & 0o7777`). */
+  mode: number;
+}
+
 /** A file create/delete/modify observed on the share. */
 export interface FileEvent {
   type: 'create' | 'delete' | 'modify';
@@ -40,9 +55,17 @@ export interface FileEvent {
   isDir: boolean;
   /**
    * The guest process the write is attributed to, when attribution is on and it resolved:
-   * `e.process.getPackage()`, `.getUID()`, `.isSystem()`, … See {@link GuestProcess}.
+   * `e.process.getPackage()`, `.getUID()`, `.isSystem()`, … See {@link GuestProcess}. When no
+   * accurate caller is available, this falls back to a process synthesised from {@link owner} (its
+   * uid), so `e.process.getUID()` still identifies the file's owner.
    */
   process?: GuestProcess;
+  /**
+   * The file's image-derived owner (uid / gid / mode from the inode), when the mapper knows it.
+   * Always present for ext4 / f2fs regardless of whether a caller could be attributed, so an event
+   * can be tied to *something* (its owner) even when fanotify is unavailable. See {@link FileOwner}.
+   */
+  owner?: FileOwner;
   /** @deprecated Use {@link process}. The same data as a plain object. */
   app?: AppInfo;
 }
@@ -618,7 +641,9 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   private nbdPort = 0;
   private nativeSize = 0;
   /** The native engine's last file listing and layer report. */
-  private engineFiles: Array<{ path: string; size: number; isDir: boolean }> = [];
+  private engineFiles: EngineFileInfo[] = [];
+  /** guest-path → image-derived owner, rebuilt from {@link engineFiles} on each native listing. */
+  private engineOwners = new Map<string, FileOwner>();
   private engineLayers: LayerInfo[] = [];
   /** Path routes to per-context stores (both engines). */
   private routes: Array<{ match: string; prefix: boolean; backendId: string }> = [];
@@ -1289,7 +1314,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       });
       this.nbdPort = opened.nbdPort;
       this.nativeSize = opened.size;
-      this.engineFiles = opened.files;
+      this.setEngineFiles(opened.files);
       this.engineLayers = opened.layers;
       this.filesystem = opened.fs;
       if (!opened.fs) this.log.warn(`NbdFileShare: image is not a recognised filesystem (${opened.fatError ?? 'unparsable'}) — host file events off; use share.watchInGuest([...]) for guest-side events`);
@@ -1467,7 +1492,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
       // with the new generation, and must not diff the two stacks against each other.
       this.generation++;
       this.stackEpoch = this.prevEpoch = r.epoch;
-      this.engineFiles = r.files;
+      this.setEngineFiles(r.files);
       this.engineLayers = r.layers;
       this.filesystem = r.fs;
       if (!r.fs) this.log.warn(`NbdFileShare: composed image is not a recognised filesystem — file events disabled (${r.fatError ?? 'unparsable'})`);
@@ -1860,7 +1885,7 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
           // A layer push/pop/swap (or an explicit rescan) happened meanwhile: the listing belongs to
           // a different stack, and diffing it against the old snapshot would invent creates and deletes.
           if (gen !== this.generation || prevSnap !== this.prev) return;
-          this.engineFiles = r.files;
+          this.setEngineFiles(r.files);
           this.engineLayers = r.layers;
           const next = this.snapshot();
           for (const ev of computeFileEvents(prevSnap, next, dirty)) this.dispatch(ev);
@@ -1884,6 +1909,14 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
   }
 
   private emitEvent(ev: FileEvent): void {
+    // Last-resort attribution: with no caller identified (attribution off, or a guest source that
+    // produced nothing), still tie the event to its image-derived owner so `e.process` is never
+    // empty when we at least know whose file it is.
+    if (!ev.process && ev.owner) {
+      const info: AppInfo = { uid: ev.owner.uid };
+      ev.app = info;
+      ev.process = toProcess(info);
+    }
     this.emit(ev.type, ev);
     this.emit('change', ev);
   }
@@ -1909,14 +1942,44 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
     return undefined;
   }
 
-  /** Attach a resolved AppInfo to an event as both `process` (the new API) and `app` (deprecated). */
+  /** Record the native engine's latest listing and rebuild the image-derived owner index from it. */
+  private setEngineFiles(files: EngineFileInfo[]): void {
+    this.engineFiles = files;
+    const owners = new Map<string, FileOwner>();
+    for (const f of files) {
+      if (f.uid === undefined && f.gid === undefined && f.mode === undefined) continue;
+      owners.set(f.path, { uid: f.uid ?? 0, gid: f.gid ?? 0, mode: f.mode ?? 0 });
+    }
+    this.engineOwners = owners;
+  }
+
+  /**
+   * The image-derived owner of a guest path (uid / gid / mode from the inode), or undefined when the
+   * mapper has no ownership for it (FAT32, an unknown path). Sourced from the native engine's listing
+   * when running native, else from the in-process mapper's `owner()` — no guest agent involved.
+   */
+  ownerOf(path: string): FileOwner | undefined {
+    if (this.native) return this.engineOwners.get(path);
+    return this.mapper?.owner?.(path);
+  }
+
+  /**
+   * Attach a resolved AppInfo to an event as both `process` (the new API) and `app` (deprecated).
+   * When the caller could not be identified but the file has an image-derived owner, fall back to a
+   * process synthesised from that owner's uid, so an event is always tied to *something*.
+   */
   private attribute(ev: FileEvent, app: AppInfo | undefined): void {
-    if (!app) return;
-    ev.app = app;
-    ev.process = toProcess(app);
+    let info = app;
+    if ((!info || info.uid === undefined) && ev.owner) info = { ...(info ?? {}), uid: ev.owner.uid };
+    if (!info) return;
+    ev.app = info;
+    ev.process = toProcess(info);
   }
 
   private dispatch(ev: FileEvent): void {
+    // Image-derived owner (uid/gid/mode from the inode) — always available with no guest agent, so
+    // every event can be tied to its owner even when accurate caller attribution is unavailable.
+    ev.owner = this.ownerOf(ev.path);
     // A file in a bound app data directory belongs to that app (gives the package id).
     const bound = this.appFromBinds(ev.path);
     // Accurate caller: when a kernel-reported source is tracked, it names the process that actually
@@ -1969,11 +2032,26 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
    * carry the real pid/uid in `e.process` (merged with the bound package when there is one). Call it
    * after the share is listening; {@link close} stops it.
    */
-  async trackCaller(source: CallerSource): Promise<void> {
+  async trackCaller(source: CallerSource): Promise<boolean> {
     await this.callerTracker?.stop().catch(() => undefined);
     const mode = this.attrMode === 'live' ? 'live' : 'cached';
-    this.callerTracker = new GuestCallerTracker(source, { mode, timeToCacheMs: this.opts.attributionTimeToCacheMs ?? 200 });
-    await this.callerTracker.start();
+    const tracker = new GuestCallerTracker(source, { mode, timeToCacheMs: this.opts.attributionTimeToCacheMs ?? 200 });
+    try {
+      await tracker.start();
+    } catch (e) {
+      // The accurate-caller source could not start (e.g. the guest kernel lacks fanotify, or the
+      // agent is missing). Report the failure and fall back to image-derived owner attribution —
+      // events still carry `e.owner` and an owner-derived `e.process`. Never crash the share.
+      await tracker.stop().catch(() => undefined);
+      this.callerTracker = undefined;
+      this.log.warn(
+        `NbdFileShare: accurate caller tracking unavailable (${(e as Error).message}); ` +
+          `falling back to image-derived owner attribution (e.owner / e.process from the inode uid)`,
+      );
+      return false;
+    }
+    this.callerTracker = tracker;
+    return true;
   }
 
   /**
@@ -1985,13 +2063,22 @@ export class NbdFileShare extends TypedEventEmitter<NbdFileShareEvents> {
    * fanotify agent present in the guest at `agentPath` (defaults to {@link
    * NbdFileShareOptions.callerAgentPath}).
    */
-  async trackCallerViaFanotify(opts: { agentPath?: string; mounts?: string[] } = {}): Promise<void> {
-    if (!this.device) throw new BlissError('trackCallerViaFanotify needs a bound device — attach the share to a VM');
+  async trackCallerViaFanotify(opts: { agentPath?: string; mounts?: string[] } = {}): Promise<boolean> {
+    // Misconfiguration and runtime unavailability alike degrade to image-derived owner attribution:
+    // enabling fanotify never crashes the share (the caller can check the returned boolean).
+    const bail = (reason: string): boolean => {
+      this.log.warn(
+        `NbdFileShare: cannot start fanotify caller tracking (${reason}); ` +
+          `falling back to image-derived owner attribution (e.owner / e.process from the inode uid)`,
+      );
+      return false;
+    };
+    if (!this.device) return bail('needs a bound device — attach the share to a VM');
     const agentPath = opts.agentPath ?? this.opts.callerAgentPath;
-    if (!agentPath) throw new BlissError('trackCallerViaFanotify needs the guest agent path (the callerAgentPath option or opts.agentPath)');
+    if (!agentPath) return bail('needs the guest agent path (the callerAgentPath option or opts.agentPath)');
     const mounts = opts.mounts?.length ? opts.mounts : this.mountPoints();
-    if (!mounts.length) throw new BlissError('trackCallerViaFanotify: no mount to watch — pass { mounts: ["/data"] } (or mount the share first with mountInGuest)');
-    await this.trackCaller(new FanotifyCallerSource(this.device.adb, { mounts, agentPath }));
+    if (!mounts.length) return bail('no mount to watch — pass { mounts: ["/data"] } (or mount the share first with mountInGuest)');
+    return this.trackCaller(new FanotifyCallerSource(this.device.adb, { mounts, agentPath }));
   }
 
   // --- cached attribution (background poller → in-RAM index) -----------------

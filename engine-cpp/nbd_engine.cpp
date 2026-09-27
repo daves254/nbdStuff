@@ -844,7 +844,7 @@ struct Fat32 : Mapper {
 // a physical-block → file map. Handles ext2/ext3 (indirect maps) and ext4 (extents, 64-bit group
 // descriptors) alike. Every count the image reports is bounded before it is believed.
 // ----------------------------------------------------------------------------------------------
-struct FileRec4 { std::string path; bool isDir; u64 size; std::vector<u64> blocks; std::vector<u64> logical; u32 ino = 0; };
+struct FileRec4 { std::string path; bool isDir; u64 size; std::vector<u64> blocks; std::vector<u64> logical; u32 ino = 0; u32 uid = 0, gid = 0, mode = 0; };
 struct Ext4 : Mapper {
   std::function<bool(i64, size_t, char*)> rd;
   i64 imageSize = 0;
@@ -873,6 +873,12 @@ struct Ext4 : Mapper {
   std::vector<char> readBlock(u64 block) const { return read((i64)block * blockSize, blockSize); }
   static u16 le16(const char* p) { return (u16)((u8)p[0] | ((u8)p[1] << 8)); }
   static u32 le32(const char* p) { return le32r(p); }
+  // Owner uid / gid and permission bits from an ext4 inode buffer.
+  static void ownerOf(const std::vector<char>& in, u32& uid, u32& gid, u32& mode) {
+    uid = (u32)le16(&in[2]) | ((u32)le16(&in[120]) << 16);
+    gid = (u32)le16(&in[24]) | ((u32)le16(&in[122]) << 16);
+    mode = le16(&in[0]) & 0xfff;
+  }
 
   void parse() {
     auto sb = read(1024, 1024);
@@ -1053,7 +1059,7 @@ struct Ext4 : Mapper {
     auto inode = readInode(ino);
     if (inode.empty()) return;
     std::vector<u64> blocks, logical; inodeBlocks(inode, blocks, logical);
-    if (!parent.empty()) reg({parent, true, le32(&inode[4]), blocks, logical, ino});
+    if (!parent.empty()) { FileRec4 r{parent, true, le32(&inode[4]), blocks, logical, ino}; ownerOf(inode, r.uid, r.gid, r.mode); reg(std::move(r)); }
     std::vector<char> dirData; for (u64 b : blocks) { auto blk = readBlock(b); dirData.insert(dirData.end(), blk.begin(), blk.end()); }
     // A directory's entries are a per-block linked list of ext4_dir_entry_2; walking each block by
     // rec_len steps entry to entry, and an htree index block (one inode-0 record spanning the block)
@@ -1076,7 +1082,7 @@ struct Ext4 : Mapper {
               else if (mode == IFREG || mode == IFLNK || fileType == 1) {
                 u64 size = (u64)le32(&child[4]) | ((u64)le32(&child[108]) << 32);
                 std::vector<u64> cb, cl; inodeBlocks(child, cb, cl);
-                reg({path, false, size, cb, cl, childIno});
+                FileRec4 r{path, false, size, cb, cl, childIno}; ownerOf(child, r.uid, r.gid, r.mode); reg(std::move(r));
               }
             }
           }
@@ -1100,7 +1106,7 @@ struct Ext4 : Mapper {
     return out;
   }
   const char* fsName() const override { return "ext4"; }
-  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)); a.push(o); } return a; }
+  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)).set("uid", J::num(f.uid)).set("gid", J::num(f.gid)).set("mode", J::num(f.mode)); a.push(o); } return a; }
 };
 
 // ----------------------------------------------------------------------------------------------
@@ -1138,6 +1144,11 @@ struct F2fs : Mapper {
   static u16 le16(const char* p) { return (u16)((u8)p[0] | ((u8)p[1] << 8)); }
   static u32 le32(const char* p) { return le32r(p); }
   static u64 le64(const char* p) { return (u64)le32r(p) | ((u64)le32r(p + 4) << 32); }
+  // Image-derived owner of an f2fs node inode: i_mode le16@0, i_uid le32@4, i_gid le32@8.
+  static void ownerOf(const std::vector<char>& in, u32& uid, u32& gid, u32& mode) {
+    if (in.size() < 12) return;
+    mode = le16(&in[0]) & 0xfff; uid = le32r(&in[4]); gid = le32r(&in[8]);
+  }
 
   void parse() {
     auto sb = read(1024, 1024);
@@ -1255,7 +1266,7 @@ struct F2fs : Mapper {
     visited.insert(ino);
     std::vector<char> inode; if (!readNode(ino, inode)) return;
     u32 inl = (u8)inode[3];
-    if (!parent.empty()) { std::vector<u64> b, l; inodeBlocks(inode, inl, b, l); reg({parent, true, le64(&inode[16]), b, l}); }
+    if (!parent.empty()) { std::vector<u64> b, l; inodeBlocks(inode, inl, b, l); FileRec4 r{parent, true, le64(&inode[16]), b, l}; ownerOf(inode, r.uid, r.gid, r.mode); reg(std::move(r)); }
     for (auto& c : dirEntries(inode, inl)) {
       if (c.name == "." || c.name == ".." || c.nid == 0) continue;
       std::string path = parent + "/" + c.name;
@@ -1265,7 +1276,7 @@ struct F2fs : Mapper {
       if (isDir) walkDir(c.nid, path, visited, depth + 1);
       else if (!(c.type == F2FS_FT_SYMLINK && (mode & 0xf000) == 0xa000)) {
         std::vector<u64> b, l; inodeBlocks(ci, cInl, b, l);
-        reg({path, false, le64(&ci[16]), b, l});
+        FileRec4 r{path, false, le64(&ci[16]), b, l}; ownerOf(ci, r.uid, r.gid, r.mode); reg(std::move(r));
       }
     }
   }
@@ -1320,7 +1331,7 @@ struct F2fs : Mapper {
     return out;
   }
   const char* fsName() const override { return "f2fs"; }
-  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)); a.push(o); } return a; }
+  J list() const override { J a = J::arr(); for (auto& f : files) { J o = J::obj(); o.set("path", J::str(f.path)).set("size", J::num((double)f.size)).set("isDir", J::boolean(f.isDir)).set("uid", J::num((double)f.uid)).set("gid", J::num((double)f.gid)).set("mode", J::num((double)f.mode)); a.push(o); } return a; }
 };
 
 // ----------------------------------------------------------------------------------------------

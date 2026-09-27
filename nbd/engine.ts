@@ -55,6 +55,20 @@ export interface NbdEngineStartOptions {
   log?: Logger;
 }
 
+/**
+ * A file the engine's mapper recognised in the composed image. `uid`/`gid`/`mode` are the
+ * image-derived owner (from the ext4/f2fs inode); they are absent for filesystems with no owner
+ * concept (FAT32) or when the mapper predates owner reporting.
+ */
+export interface EngineFileInfo {
+  path: string;
+  size: number;
+  isDir: boolean;
+  uid?: number;
+  gid?: number;
+  mode?: number;
+}
+
 export interface OpenExportOptions {
   image: string;
   size?: number;
@@ -80,7 +94,7 @@ export interface OpenedExport {
   /** Why the image could not be mapped (when {@link fs} is absent). */
   fatError?: string;
   layers: LayerInfo[];
-  files: Array<{ path: string; size: number; isDir: boolean }>;
+  files: EngineFileInfo[];
 }
 
 export interface EngineStats {
@@ -340,7 +354,7 @@ export class NbdEngine extends TypedEventEmitter<NbdEngineEvents> {
   }
 
   /** Re-parse the composed image and return its files (empty when it is neither FAT32 nor ext4). */
-  async rescan(): Promise<{ fat32: boolean; fs?: 'fat32' | 'ext4' | 'f2fs'; files: Array<{ path: string; size: number; isDir: boolean }>; layers: LayerInfo[]; epoch: number; fatError?: string }> {
+  async rescan(): Promise<{ fat32: boolean; fs?: 'fat32' | 'ext4' | 'f2fs'; files: EngineFileInfo[]; layers: LayerInfo[]; epoch: number; fatError?: string }> {
     const r = await this.request('rescan');
     return {
       fat32: !!r.header.fat32,
@@ -351,7 +365,7 @@ export class NbdEngine extends TypedEventEmitter<NbdEngineEvents> {
       ...(r.header.fatError ? { fatError: String(r.header.fatError) } : {}),
     };
   }
-  async list(): Promise<Array<{ path: string; size: number; isDir: boolean }>> {
+  async list(): Promise<EngineFileInfo[]> {
     return filesOf((await this.request('list')).header);
   }
 
@@ -450,8 +464,15 @@ function layersOf(h: Record<string, unknown>): LayerInfo[] {
     readonly: !!l.readonly,
   }));
 }
-function filesOf(h: Record<string, unknown>): Array<{ path: string; size: number; isDir: boolean }> {
-  return ((h.files as Array<Record<string, unknown>>) ?? []).map((f) => ({ path: String(f.path), size: Number(f.size), isDir: !!f.isDir }));
+function filesOf(h: Record<string, unknown>): EngineFileInfo[] {
+  return ((h.files as Array<Record<string, unknown>>) ?? []).map((f) => ({
+    path: String(f.path),
+    size: Number(f.size),
+    isDir: !!f.isDir,
+    ...(f.uid !== undefined ? { uid: Number(f.uid) } : {}),
+    ...(f.gid !== undefined ? { gid: Number(f.gid) } : {}),
+    ...(f.mode !== undefined ? { mode: Number(f.mode) } : {}),
+  }));
 }
 /** The filesystem the engine's mapper recognised, from the new `fs` field or the legacy `fat32` flag. */
 function fsOf(h: Record<string, unknown>): 'fat32' | 'ext4' | 'f2fs' | undefined {

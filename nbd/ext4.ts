@@ -11,6 +11,10 @@ interface FileRec {
   size: number;
   /** The file's inode number. */
   ino: number;
+  /** Owner uid / gid and permission bits, from the inode (image-derived attribution). */
+  uid: number;
+  gid: number;
+  mode: number;
   /** Physical blocks in logical order (index i = the file's logical block i). */
   blocks: number[];
   /** The logical block number each entry of {@link blocks} stands for (holes leave gaps). */
@@ -419,7 +423,7 @@ export class Ext4Mapper implements FileMapper {
     const { blocks, logical } = this.inodeBlocks(inode);
     if (parentPath !== '') {
       // Record the directory's own blocks so metadata writes to it map to the directory.
-      this.register({ path: parentPath, isDir: true, size: inode.readUInt32LE(4), ino, blocks, logical });
+      this.register({ path: parentPath, isDir: true, size: inode.readUInt32LE(4), ino, ...ownerOfInode(inode), blocks, logical });
     }
     const dirData = this.readAll(blocks);
     // A directory's entries are a per-block linked list of ext4_dir_entry_2; walking the whole data
@@ -450,7 +454,7 @@ export class Ext4Mapper implements FileMapper {
                 const sizeHi = child.readUInt32LE(108);
                 const size = sizeLo + sizeHi * 0x1_0000_0000;
                 const cb = this.inodeBlocks(child);
-                this.register({ path, isDir: false, size, ino: childIno, blocks: cb.blocks, logical: cb.logical });
+                this.register({ path, isDir: false, size, ino: childIno, ...ownerOfInode(child), blocks: cb.blocks, logical: cb.logical });
               }
             }
           }
@@ -495,6 +499,12 @@ export class Ext4Mapper implements FileMapper {
     return this.files.map((f) => ({ path: f.path, size: f.size, isDir: f.isDir }));
   }
 
+  /** The file's owner uid / gid and permission bits (image-derived attribution). */
+  owner(path: string): { uid: number; gid: number; mode: number } | undefined {
+    const rec = this.files.find((f) => f.path === path);
+    return rec ? { uid: rec.uid, gid: rec.gid, mode: rec.mode } : undefined;
+  }
+
   /** The byte extents (offset/length pairs) a file occupies in the image, in logical order. */
   extents(path: string): Array<{ offset: number; length: number }> {
     const rec = this.files.find((f) => f.path === path);
@@ -529,6 +539,15 @@ export class Ext4Mapper implements FileMapper {
   csumInfo(): Ext4CsumInfo {
     return { inodeSize: this.geo.inodeSize, csumSeed: this.geo.csumSeed, metadataCsum: this.geo.metadataCsum };
   }
+}
+
+/** Owner uid / gid and permission bits from an ext4 inode buffer. */
+function ownerOfInode(inode: Buffer): { uid: number; gid: number; mode: number } {
+  return {
+    uid: inode.readUInt16LE(2) | (inode.readUInt16LE(120) << 16),
+    gid: inode.readUInt16LE(24) | (inode.readUInt16LE(122) << 16),
+    mode: inode.readUInt16LE(0) & 0o7777,
+  };
 }
 
 function pushMerged(out: TouchedFile[], t: TouchedFile): void {
