@@ -118,16 +118,26 @@ int main(int argc, char **argv) {
   int fan = fan_init(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY | O_LARGEFILE);
   if (fan < 0) {
     int e = errno;
-    fprintf(stderr, "fanotify_init failed: %s (errno %d)\n", strerror(e), e);
-    if (e == ENOSYS)
+    fprintf(stderr, "fanotify_init failed: %s (errno %d); euid=%ld\n", strerror(e), e, (long)geteuid());
+    if (e == ENOSYS) {
+      // Self-diagnose: report the seccomp mode so you can tell "kernel lacks fanotify" (Seccomp 0)
+      // from "a seccomp filter is masking it" (Seccomp 2).
+      char st[4096];
+      const char *sec = "unknown";
+      if (read_small("/proc/self/status", st, sizeof st) > 0) {
+        char *p = strstr(st, "Seccomp:");
+        if (p) { p += 8; while (*p == ' ' || *p == '\t') p++; sec = (*p == '2') ? "2 (a seccomp filter IS active — it is masking fanotify)" : (*p == '0') ? "0 (no seccomp filter — the kernel likely lacks CONFIG_FANOTIFY)" : p; }
+      }
       fprintf(stderr,
-              "  ENOSYS = the syscall is unavailable here. On Android this is usually the seccomp\n"
-              "  filter of the shell/app domain masking fanotify as \"not implemented\", or a kernel\n"
-              "  built without CONFIG_FANOTIFY. Run under root/su (e.g. `su -c '%s <mount>'`), which\n"
-              "  escapes the shell seccomp filter; if it still returns ENOSYS the kernel lacks fanotify.\n",
-              argv[0]);
-    else if (e == EPERM || e == EACCES)
-      fprintf(stderr, "  Need CAP_SYS_ADMIN — run as root (`adb root`, or `su -c`).\n");
+              "  ENOSYS = the syscall is unavailable here. Seccomp mode: %s\n"
+              "  If Seccomp is 2, a filter (the shell/app domain) is blocking fanotify — launch the\n"
+              "  agent from a context without that filter (an init service), not `adb shell`.\n"
+              "  If Seccomp is 0, the kernel was built without CONFIG_FANOTIFY — fanotify is impossible\n"
+              "  on this kernel; use inotify (watchInGuest, no pid) or a kernel with fanotify.\n",
+              sec);
+    } else if (e == EPERM || e == EACCES) {
+      fprintf(stderr, "  Need CAP_SYS_ADMIN — run as root (`adb root`).\n");
+    }
     return 1;
   }
 
